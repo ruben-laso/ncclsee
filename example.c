@@ -45,34 +45,12 @@ static const char* nccl_coll_names[nccl_num_colls] = {
 /* static const int groupPoolSize = 128; */
 /* static const int collPoolSize = 128; */
 
-// Counters for each collective type.
-// static uint64_t allReduceCount = 0;
-// static uint64_t broadcastCount = 0;
-// static uint64_t reduceCount = 0;
-// static uint64_t reduceScatterCount = 0;
-// static uint64_t allGatherCount = 0;
-// static uint64_t allToAllCount = 0;
-// static uint64_t unknownCount = 0;
-// static uint64_t allReduceBytes = 0;
-// static uint64_t broadcastBytes = 0;
-// static uint64_t reduceBytes = 0;
-// static uint64_t reduceScatterBytes = 0;
-// static uint64_t allGatherBytes = 0;
-// static uint64_t allToAllBytes = 0;
-// static uint64_t unknownBytes = 0;
-// static double allReduceTime = 0;
-// static double broadcastTime = 0;
-// static double reduceTime = 0;
-// static double reduceScatterTime = 0;
-// static double allGatherTime = 0;
-// static double allToAllTime = 0;
-// static double unknownTime = 0;
 
 static struct {
     uint64_t count;
     uint64_t bytes;
     double time;
-} stats[nccl_num_colls] = {};
+} stats[nccl_num_colls] = {0};
 
 struct group;
 struct context;
@@ -97,6 +75,7 @@ struct collective {
   uint8_t type;
   struct group* parent;
   int refCount;
+  enum nccl_colls name;   // Index in the collective name array
   double startTs;
   double stopTs;
 };
@@ -113,29 +92,35 @@ struct context {
 };
 
 static int initialized;             // initialization counter for profiler
-/* static FILE *debug_file; */
+static FILE *debug_file = NULL;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pid_t pid;
 static double startTime;
 
 
 static double freq = -1;
+
 __hidden void calibrate() {
   struct timeval tv;
   gettimeofday(&tv, NULL);
   uint64_t timeCycles = __rdtsc();
   double time = - tv.tv_sec*1e6 - tv.tv_usec;
   uint64_t total = 0ULL;
+  // Dummy loop to let some time pass
   for (int i = 0; i < 10000; i++) total += __rdtsc();
+
   gettimeofday(&tv, NULL);
-  timeCycles = __rdtsc() - timeCycles;
-  time += tv.tv_sec*1e6 + tv.tv_usec;
+
+  timeCycles = __rdtsc() - timeCycles;  // Compute elapsed cycles
+  time += tv.tv_sec*1e6 + tv.tv_usec;  // Compute elapsed real-world time
   freq = timeCycles / time;
 }
 
+// returns current timestamp in useconds
 __hidden double gettime(void) {
   return __rdtsc() / freq;
 }
+
 
 
 __hidden ncclResult_t Profiler_Init(void** context, int* eActivationMask) {
@@ -153,8 +138,14 @@ __hidden ncclResult_t Profiler_Init(void** context, int* eActivationMask) {
   }
   pthread_mutex_unlock(&lock);
 
-  //fprintf(stderr, "Profiler_Init: eActivationMask = %d\n", *eActivationMask);
-    // Allocate memory for the context
+
+  fprintf(stderr, "Profiler_Init: %s\n",plugin_name);
+  fprintf(stderr, "Profiler_Init: eActivationMask = %d\n", *eActivationMask);
+
+  char debug_file_name[64];
+  snprintf(debug_file_name, 64, "./fools_debug_%d.log", pid);
+  debug_file = fopen(debug_file_name, "a+");
+  // Allocate memory for the context
   struct context* ctx = (struct context*)calloc(1, sizeof(struct context));
   if (ctx == NULL) {
       fprintf(stderr, "Profiler_Init: Failed to allocate memory for context\n");
@@ -172,32 +163,34 @@ __hidden ncclResult_t Profiler_Init(void** context, int* eActivationMask) {
 
 __hidden ncclResult_t Profiler_Finalize(void* context) {
 
-  //struct context* ctx = (struct context *)context;
-  /* fprintf(stderr, "\n=== NCCL Profiling Summary ===\n"); */
-  /* fprintf(stderr, "AllReduce calls:       %" PRIu64 "\n", allReduceCount); */
-  /* fprintf(stderr, "Broadcast calls:       %" PRIu64 "\n", broadcastCount); */
-  /* fprintf(stderr, "Reduce calls:          %" PRIu64 "\n", reduceCount); */
-  /* fprintf(stderr, "ReduceScatter calls:   %" PRIu64 "\n", reduceScatterCount); */
-  /* fprintf(stderr, "AllGather calls:       %" PRIu64 "\n", allGatherCount); */
-  /* fprintf(stderr, "AllToAll calls:        %" PRIu64 "\n", allToAllCount); */
-  /* fprintf(stderr, "Unknown calls:         %" PRIu64 "\n", unknownCount); */
-  /* fprintf(stderr, "=============================\n\n"); */
+/* fprintf(stderr, "\n=== NCCL Profiling Summary ===\n"); */
+/* fprintf(stderr, "%-18s %-12s %-20s\n", "Collective Type", "Calls", "Bytes Transferred"); */
+/* fprintf(stderr, "---------------------------------------------------------\n"); */
+/* fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "AllReduce:", allReduceCount, allReduceBytes); */
+/* fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "Broadcast:", broadcastCount, broadcastBytes); */
+/* fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "Reduce:", reduceCount, reduceBytes); */
+/* fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "ReduceScatter:", reduceScatterCount, reduceScatterBytes); */
+/* fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "AllGather:", allGatherCount, allGatherBytes); */
+/* fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "AllToAll:", allToAllCount, allToAllBytes); */
+/* fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "Unknown:", unknownCount, unknownBytes); */
+/* fprintf(stderr, "=========================================================\n\n"); */
 
-fprintf(stderr, "\n=== NCCL Profiling Summary ===\n");
-fprintf(stderr, "%-18s %-12s %-20s\n", "Collective Type", "Calls", "Bytes Transferred");
-fprintf(stderr, "---------------------------------------------------------\n");
-fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "AllReduce:", allReduceCount, allReduceBytes);
-fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "Broadcast:", broadcastCount, broadcastBytes);
-fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "Reduce:", reduceCount, reduceBytes);
-fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "ReduceScatter:", reduceScatterCount, reduceScatterBytes);
-fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "AllGather:", allGatherCount, allGatherBytes);
-fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "AllToAll:", allToAllCount, allToAllBytes);
-fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "Unknown:", unknownCount, unknownBytes);
-fprintf(stderr, "=========================================================\n\n");
+  fprintf(stderr, "\n=================== NCCL PROFILING SUMMARY ===================\n");
+  fprintf(stderr, "%-18s %-12s %-15s %-15s\n",
+          "Collective Type", "Calls", "Bytes Transferred", "Total Time (us)");
+  fprintf(stderr, "--------------------------------------------------------------------------\n");
+
+  for (int i = 0; i < nccl_num_colls; i++) {
+    fprintf(stderr, "%-18s %-12" PRIu64 " %-15" PRIu64 " %-15.6f\n",
+            nccl_coll_names[i], stats[i].count, stats[i].bytes, stats[i].time);
+  }
+
+  fprintf(stderr, "==========================================================================\n\n");
 
 
-  /* fclose(ctx->debug_file); */
-  /* free(ctx); */
+  struct context* ctx = (struct context*)context;
+  free(ctx);
+  if (debug_file) fclose(debug_file);
   return ncclSuccess;
 }
 
@@ -233,65 +226,76 @@ ncclResult_t Profiler_Event_Start(void* context, void** eHandle, ncclProfilerEve
         event->type = ncclProfileColl;
         size_t trafficBytes = eDescr->coll.trafficBytes;
         event->parent = (struct group*)eDescr->parentObj;
-        event->name = eDescr->coll.func;
+        const char* name = eDescr->coll.func;
         event->startTs = gettime() - startTime;
         __atomic_fetch_add(&parent->refCount, 1, __ATOMIC_RELAXED);
         *eHandle = event;
-        if (strcmp(eDescr->coll.func, "AllReduce") == 0) {
-          __atomic_fetch_add(&allReduceCount, 1, __ATOMIC_RELAXED);
-          __atomic_fetch_add(&allReduceBytes, trafficBytes, __ATOMIC_RELAXED);
+        if (strcmp(name, "AllReduce") == 0) {
+          event->name = nccl_allreduce;
+          /* __atomic_fetch_add(&allReduceCount, 1, __ATOMIC_RELAXED); */
+          /* __atomic_fetch_add(&allReduceBytes, trafficBytes, __ATOMIC_RELAXED); */
         }
-        else if (strcmp(eDescr->coll.func, "Broadcast") == 0) {
-          __atomic_fetch_add(&broadcastCount, 1, __ATOMIC_RELAXED);
-          __atomic_fetch_add(&broadcastBytes, trafficBytes, __ATOMIC_RELAXED);
+        else if (strcmp(name, "Broadcast") == 0) {
+          event->name = nccl_broadcast;
+          /* __atomic_fetch_add(&broadcastCount, 1, __ATOMIC_RELAXED); */
+          /* __atomic_fetch_add(&broadcastBytes, trafficBytes, __ATOMIC_RELAXED); */
         }
-        else if (strcmp(eDescr->coll.func, "Reduce") == 0) {
-          __atomic_fetch_add(&reduceCount, 1, __ATOMIC_RELAXED);
-          __atomic_fetch_add(&reduceBytes, trafficBytes, __ATOMIC_RELAXED);
+        else if (strcmp(name, "Reduce") == 0) {
+          event->name = nccl_reduce;
+          /* __atomic_fetch_add(&reduceCount, 1, __ATOMIC_RELAXED); */
+          /* __atomic_fetch_add(&reduceBytes, trafficBytes, __ATOMIC_RELAXED); */
         }
-        else if (strcmp(eDescr->coll.func, "ReduceScatter") == 0) {
-          __atomic_fetch_add(&reduceScatterCount, 1, __ATOMIC_RELAXED);
-          __atomic_fetch_add(&reduceScatterBytes, trafficBytes, __ATOMIC_RELAXED);
+        else if (strcmp(name, "ReduceScatter") == 0) {
+          event->name = nccl_reduce_scatter;
+          /* __atomic_fetch_add(&reduceScatterCount, 1, __ATOMIC_RELAXED); */
+          /* __atomic_fetch_add(&reduceScatterBytes, trafficBytes, __ATOMIC_RELAXED); */
         }
-        else if (strcmp(eDescr->coll.func, "AllGather") == 0) {
-          __atomic_fetch_add(&allGatherCount, 1, __ATOMIC_RELAXED);
-          __atomic_fetch_add(&allGatherBytes, trafficBytes, __ATOMIC_RELAXED);
+        else if (strcmp(name, "AllGather") == 0) {
+          event->name = nccl_allgather;
+          /* __atomic_fetch_add(&allGatherCount, 1, __ATOMIC_RELAXED); */
+          /* __atomic_fetch_add(&allGatherBytes, trafficBytes, __ATOMIC_RELAXED); */
         }
-        else if (strcmp(eDescr->coll.func, "AllToAll") == 0) {
-          __atomic_fetch_add(&allToAllCount, 1, __ATOMIC_RELAXED);
-          __atomic_fetch_add(&allToAllBytes, trafficBytes, __ATOMIC_RELAXED);
+        else if (strcmp(name, "AllToAll") == 0) {
+          event->name = nccl_alltoall;
+          /* __atomic_fetch_add(&allToAllCount, 1, __ATOMIC_RELAXED); */
+          /* __atomic_fetch_add(&allToAllBytes, trafficBytes, __ATOMIC_RELAXED); */
         }
         // Keeping track of this for now for debugging purposes
         else {
-          __atomic_fetch_add(&unknownCount, 1, __ATOMIC_RELAXED);
-          __atomic_fetch_add(&unknownBytes, trafficBytes, __ATOMIC_RELAXED);
+          event->name = nccl_unknown;
+          /* __atomic_fetch_add(&unknownCount, 1, __ATOMIC_RELAXED); */
+          /* __atomic_fetch_add(&unknownBytes, trafficBytes, __ATOMIC_RELAXED); */
         }
+        // It is better to update those now so we dont carry them around
+        __atomic_fetch_add(&stats[event->name].count, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&stats[event->name].bytes, trafficBytes, __ATOMIC_RELAXED);
     } else if (eDescr->type == ncclProfileProxyOp) {
       // We will need to change this for p2p
       struct collective* eventBase = (struct collective *)eDescr->parentObj;
       if (eventBase == NULL) return ncclSuccess;
+      fprintf(debug_file, "ProxyOp\n");
       if ( eDescr->proxyOp.pid != pid ){
-        struct proxyOp* event;
-        int detachId = __atomic_fetch_add(&detachPoolIndex, 1, __ATOMIC_RELAXED) % detachPoolSize;
-        event = &detachPool[detachId];
+        int index = __atomic_fetch_add(&ctx->proxyIndex, 1, __ATOMIC_RELAXED) % PROXY_POOL_SIZE;
+        struct proxyOp* event = &ctx->proxyPool[index];
         event->type = ncclProfileProxyOp;
         event->pid = eDescr->proxyOp.pid;
         event->parent = NULL;
         *eHandle = event;
         return ncclSuccess;
       }
-    }
 
     if (eventBase->type == ncclProfileColl) {
       // Cannot be NULL
       struct collective* parent = (struct collective *)eDescr->parentObj;
+      int index = __atomic_fetch_add(&ctx->proxyIndex, 1, __ATOMIC_RELAXED) % PROXY_POOL_SIZE;
+      struct proxyOp* event = &ctx->proxyPool[index];
       event->type = ncclProfileProxyOp;
       event->pid = eDescr->proxyOp.pid;
       event->parent = parent;
       __atomic_fetch_add(&parent->refCount, 1, __ATOMIC_RELAXED);
       *eHandle = event;
     }
-
+    }
 
     return ncclSuccess;
 }
@@ -304,49 +308,26 @@ static void updateEvent(void* handle) {
     uint8_t type = *(uint8_t*)handle;
     if (type == ncclProfileGroup){
       struct group* event = (struct group *)handle;
+      __atomic_sub_fetch(&event->refCount, 1, __ATOMIC_RELAXED);
+      // We are not measuring group time yet
+      /* if (__atomic_sub_fetch(&event->refCount, 1, __ATOMIC_RELAXED) == 0) { */
+      /*    event->stopTs = gettime() - startTime; */
+      /* } */
+    } else if (type == ncclProfileColl) {
+      struct collective* event = (struct collective *)handle;
       if (__atomic_sub_fetch(&event->refCount, 1, __ATOMIC_RELAXED) == 0) {
         event->stopTs = gettime() - startTime;
-        // return group event to the pool
-        //__atomic_fetch_add(&event->ctx->groupPoolBase, 1, __ATOMIC_RELAXED);
-      }
-    } else if {
-      struct collective* event = (struct collective *)handle;
-      if (__atomic_sub_fetch(&event->base.refCount, 1, __ATOMIC_RELAXED) == 0) {
-        event->base.stopTs = gettime() - startTime;
-        double duration = event->base.stopTs - event->base.startTs;
-        if (strcmp(eDescr->coll.func, "AllReduce") == 0) {
-          __atomic_fetch_add(&allReduceTime, duration, __ATOMIC_RELAXED);
-        }
-        else if (strcmp(eDescr->coll.func, "Broadcast") == 0) {
-          __atomic_fetch_add(&broadcastTime, duration, __ATOMIC_RELAXED);
-        }
-        else if (strcmp(eDescr->coll.func, "Reduce") == 0) {
-          __atomic_fetch_add(&reduceTime, duration, __ATOMIC_RELAXED);
-        }
-        else if (strcmp(eDescr->coll.func, "ReduceScatter") == 0) {
-          __atomic_fetch_add(&reduceScatterTime, duration, __ATOMIC_RELAXED);
-        }
-        else if (strcmp(eDescr->coll.func, "AllGather") == 0) {
-          __atomic_fetch_add(&allGatherTime, duration, __ATOMIC_RELAXED);
-        }
-        else if (strcmp(eDescr->coll.func, "AllToAll") == 0) {
-          __atomic_fetch_add(&allToAllTime, duration, __ATOMIC_RELAXED);
-        }
-        // Keeping track of this for now for debugging purposes
-        else {
-          __atomic_fetch_add(&unknownTime, duration, __ATOMIC_RELAXED);
-        }
-        updateEvent(event->base.parent);
+        double duration = event->stopTs - event->startTs;
+        // Update the time in stats
+        fprintf(debug_file, "Collective %s took %lf us\n", nccl_coll_names[event->name], duration);
+        stats[event->name].time += duration;
+        updateEvent(event->parent);
         return;
       }
-    }
     } else if (type == ncclProfileProxyOp) {
       struct proxyOp* event = (struct proxyOp *)handle;
-      if (__atomic_sub_fetch(&event->parent->refCount, 1, __ATOMIC_RELAXED) == 0) {
-        event->stopTs = gettime() - startTime;
-        // return proxy event to the pool
-        //__atomic_fetch_add(&event->ctx->proxyPoolBase, 1, __ATOMIC_RELAXED);
-      }
+      // We are not measuring proxy ops time yet
+      updateEvent(event->parent);
     }
 }
 
@@ -355,25 +336,27 @@ __hidden ncclResult_t Profiler_Event_Stop(void* eHandle) {
   uint8_t type = *(uint8_t*)eHandle;
 
   if (type == ncclProfileGroup) {
-    struct group* g = (struct group*) eHandle;
-    g->stopTs = getTime() - startTime;
+    //struct group* event = (struct group*) eHandle;
+    //event->stopTs = getTime() - startTime;
     return ncclSuccess;
   }
   else if (type == ncclProfileColl) {
-    struct collective* c = (struct collective*) eHandle;
-    c->stopTs = getTime() -startTime;
+    struct collective* event = (struct collective*) eHandle;
+    event->stopTs = gettime() -startTime;
+    double duration = event->stopTs - event->startTs;
+    stats[event->name].time += duration;
     return ncclSuccess;
   }
   else if (type == ncclProfileProxyOp) {
-    struct proxyOp* p = (struct proxyOp*) eHandle;
-    p->stopTs = getTime()- startTime;
+    //struct proxyOp* event = (struct proxyOp*) eHandle;
+    // event->stopTs = getTime()- startTime;
     // Now that the proxy op is done, finalize it by calling updateEvent
     updateEvent(eHandle);
     return ncclSuccess;
   }
 
-  // If other types exist:
-  // updateEvent(eHandle);
+  // If other types exist such as ncclProfileP2p, we can add them here
+  updateEvent(eHandle);
   return ncclSuccess;
 }
 
