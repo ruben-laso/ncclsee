@@ -7,6 +7,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <inttypes.h>
+#include <stdbool.h>
 #include <x86intrin.h>
 #include <stdatomic.h>
 #include "profiler.h"
@@ -68,7 +69,7 @@ static const char* nccl_p2p_names[nccl_num_p2p] = {
 static struct {
     uint64_t count;
     uint64_t bytes;
-    double time;
+    _Atomic double time;
   // We may add more things here
 } stats[nccl_num_colls] = {0};
 
@@ -76,12 +77,12 @@ static struct {
 static struct {
     uint64_t count;
     uint64_t typecount;
-    double time;
+    _Atomic double time;
 } stats_p2p[nccl_num_p2p] = {0};
 
 static struct {
     uint64_t count;
-    double time;
+    _Atomic double time;
 } stats_group = {0};
 
 struct context;
@@ -173,6 +174,15 @@ __hidden double gettime(void) {
 
 
 
+void atomic_add_double(_Atomic double *target, double increment) {
+    double current;
+    double desired;
+    do {
+        current = atomic_load(target);
+        desired = current + increment;
+    } while (!atomic_compare_exchange_weak(target, &current, desired));
+}
+
 __hidden ncclResult_t Profiler_Init(void** context, int* eActivationMask) {
 
   pthread_mutex_lock(&lock);
@@ -189,12 +199,13 @@ __hidden ncclResult_t Profiler_Init(void** context, int* eActivationMask) {
   pthread_mutex_unlock(&lock);
 
 
-  fprintf(stderr, "Profiler_Init: %s\n",plugin_name);
-  fprintf(stderr, "Profiler_Init: eActivationMask = %d\n", *eActivationMask);
-
+  /* fprintf(stderr, "Profiler_Init: %s\n",plugin_name); */
+  /* fprintf(stderr, "Profiler_Init: eActivationMask = %d\n", *eActivationMask); */
+#ifdef DEBUG
   char debug_file_name[64];
   snprintf(debug_file_name, 64, "./fools_debug_%d.log", pid);
   debug_file = fopen(debug_file_name, "a+");
+#endif
   // Allocate memory for the context
   struct context* ctx = (struct context*)calloc(1, sizeof(struct context));
   if (ctx == NULL) {
@@ -213,19 +224,6 @@ __hidden ncclResult_t Profiler_Init(void** context, int* eActivationMask) {
 }
 
 __hidden ncclResult_t Profiler_Finalize(void* context) {
-
-/* fprintf(stderr, "\n=== NCCL Profiling Summary ===\n"); */
-/* fprintf(stderr, "%-18s %-12s %-20s\n", "Collective Type", "Calls", "Bytes Transferred"); */
-/* fprintf(stderr, "---------------------------------------------------------\n"); */
-/* fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "AllReduce:", allReduceCount, allReduceBytes); */
-/* fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "Broadcast:", broadcastCount, broadcastBytes); */
-/* fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "Reduce:", reduceCount, reduceBytes); */
-/* fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "ReduceScatter:", reduceScatterCount, reduceScatterBytes); */
-/* fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "AllGather:", allGatherCount, allGatherBytes); */
-/* fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "AllToAll:", allToAllCount, allToAllBytes); */
-/* fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "Unknown:", unknownCount, unknownBytes); */
-/* fprintf(stderr, "=========================================================\n\n"); */
-
 
   fprintf(stderr, "\n=================== NCCL PROFILING SUMMARY ===================\n");
 
@@ -255,7 +253,10 @@ __hidden ncclResult_t Profiler_Finalize(void* context) {
 ncclResult_t Profiler_Event_Start(void* context, void** eHandle, ncclProfilerEventDescr_t* eDescr){
   *eHandle = NULL;
   struct context* ctx = (struct context*)context;
-  //fprintf(debug_file, "Profiler_Event_Start: %d\n", eDescr->type);
+#ifdef DEBUG
+  fprintf(debug_file, "Profiler_Event_Start: %d\n", eDescr->type);
+  fflush(debug_file);
+#endif
 
     if (eDescr->type == ncclProfileGroup) {
         /* struct group* event = (struct group*)malloc(sizeof(struct group)); */
@@ -267,8 +268,8 @@ ncclResult_t Profiler_Event_Start(void* context, void** eHandle, ncclProfilerEve
         struct group* event = &ctx->groupPool[index];
         event->ctx = ctx;
         event->type = ncclProfileGroup;
-        event->startTs = gettime() - startTime;
         __atomic_fetch_add(&stats_group.count, 1, __ATOMIC_RELAXED);
+        event->startTs = gettime();
         *eHandle = event;
     } else if (eDescr->type == ncclProfileColl) {
 
@@ -283,7 +284,6 @@ ncclResult_t Profiler_Event_Start(void* context, void** eHandle, ncclProfilerEve
         event->base.parent = parent;
         const char* name = eDescr->coll.func;
         __atomic_fetch_add(&parent->refCount, 1, __ATOMIC_RELAXED);
-        *eHandle = event;
         if (strcmp(name, "AllReduce") == 0) {
           event->name = nccl_allreduce;
         }
@@ -309,7 +309,8 @@ ncclResult_t Profiler_Event_Start(void* context, void** eHandle, ncclProfilerEve
         // It is better to update those now so we dont carry them around
         __atomic_fetch_add(&stats[event->name].count, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&stats[event->name].bytes, trafficBytes, __ATOMIC_RELAXED);
-        event->base.startTs = gettime() - startTime;
+        event->base.startTs = gettime();
+        *eHandle = event;
     } else if (eDescr->type == ncclProfileP2p) {
       struct group* parent = (struct group *)eDescr->parentObj;
       if (parent == NULL) return ncclSuccess;
@@ -317,7 +318,6 @@ ncclResult_t Profiler_Event_Start(void* context, void** eHandle, ncclProfilerEve
       struct p2p* event = &ctx->p2pPool[index];
       event->base.type = ncclProfileP2p;
       event->base.parent = parent;
-      *eHandle = event;
       if (strcmp(eDescr->p2p.func, "Send") == 0) {
         event->name = nccl_p2p_send;
       }
@@ -329,9 +329,8 @@ ncclResult_t Profiler_Event_Start(void* context, void** eHandle, ncclProfilerEve
       }
       __atomic_fetch_add(&stats_p2p[event->name].count, 1, __ATOMIC_RELAXED);
       __atomic_fetch_add(&stats_p2p[event->name].typecount, eDescr->p2p.count, __ATOMIC_RELAXED);
-      event->base.startTs = gettime() - startTime;
-
-
+      event->base.startTs = gettime();
+      *eHandle = event;
 
     } else if (eDescr->type ==  ncclProfileProxyOp) {
 
@@ -384,14 +383,14 @@ static void updateEvent(void* handle) {
     if (type == ncclProfileGroup){
       struct group* event = (struct group *)handle;
       if (__atomic_sub_fetch(&event->refCount, 1, __ATOMIC_RELAXED) == 0) {
-         event->stopTs = gettime() - startTime;
+         event->stopTs = gettime();
          double duration = event->stopTs - event->startTs;
          stats_group.time += duration;
       }
     } else if (type == ncclProfileColl) {
       struct collective* event = (struct collective *)handle;
       if (__atomic_sub_fetch(&event->base.refCount, 1, __ATOMIC_RELAXED) == 0) {
-        event->base.stopTs = gettime() - startTime;
+        event->base.stopTs = gettime();
         double duration = event->base.stopTs - event->base.startTs;
         // Update the time in stats
         //fprintf(debug_file, "Collective %s took %lf us\n", nccl_coll_names[event->name], duration);
@@ -402,7 +401,7 @@ static void updateEvent(void* handle) {
     } else if ( type == ncclProfileP2p ) {
       struct p2p* event = (struct p2p *)handle;
       if (__atomic_sub_fetch(&event->base.refCount, 1, __ATOMIC_RELAXED) == 0) {
-        event->base.stopTs = gettime() - startTime;
+        event->base.stopTs = gettime();
         double duration = event->base.stopTs - event->base.startTs;
         // Update the time in stats
         //fprintf(debug_file, "P2P %s took %lf us\n", nccl_p2p_names[event->name], duration);
@@ -422,29 +421,39 @@ __hidden ncclResult_t Profiler_Event_Stop(void* eHandle) {
   if (eHandle == NULL) return ncclSuccess;
 
   uint8_t type = *(uint8_t*)eHandle;
+#ifdef DEBUG
+  fprintf(debug_file, "Profiler_Event_Stop: %d\n", type);
+  fflush(debug_file);
+#endif
 
   if (type == ncclProfileGroup) {
     struct group* event = (struct group*) eHandle;
-    event->stopTs = gettime() - startTime;
-    stats_group.time += event->stopTs - event->startTs;
+    event->stopTs = gettime();
+    // Update the time in stats atomically
+    atomic_add_double(&stats_group.time, event->stopTs - event->startTs);
+#ifdef DEBUG
+    fprintf(debug_file, "Group took %lf us, Accumulated %lf\n", event->stopTs - event->startTs, stats_group.time);
+    fflush(debug_file);
+#endif
     // Update the time in case proxy ops are used
-    event->startTs = event->stopTs;
+    //event->startTs = event->stopTs;
     return ncclSuccess;
   }
   else if (type == ncclProfileColl) {
     struct collective* event = (struct collective*) eHandle;
-    event->base.stopTs = gettime() -startTime;
-    stats[event->name].time += event->base.stopTs - event->base.startTs;
+    event->base.stopTs = gettime();
+    // Update the time in collective stats atomically
+    atomic_add_double(&stats[event->name].time, event->base.stopTs - event->base.startTs);
     // Update the time in case proxy ops are used
-    event->base.startTs = event->base.stopTs;
+    // event->base.startTs = event->base.stopTs;
     return ncclSuccess;
   }
   else if (type == ncclProfileP2p) {
     struct p2p* event = (struct p2p*) eHandle;
-    event->base.stopTs = gettime()- startTime;
+    event->base.stopTs = gettime();
     stats_p2p[event->name].time +=  event->base.stopTs - event->base.startTs;
     // Update the time in case proxy ops are used
-    event->base.startTs = event->base.stopTs;
+    //event->base.startTs = event->base.stopTs;
     return ncclSuccess;
   }
 

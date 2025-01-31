@@ -5,7 +5,7 @@ PLUGIN_SO := libnccl-profiler.so
 default: $(PLUGIN_SO)
 
 $(PLUGIN_SO): example.c
-	$(CC) $(INC) -Wall -Wextra -std=c11 -g -fPIC -shared -o $@ -Wl,-soname,$(PLUGIN_SO) $^
+	$(CC) $(INC) -Wall -Wextra -std=c11 -g -fPIC -shared -o $@ -Wl,-soname,$(PLUGIN_SO) $^ -latomic -pthread
 
 clean:
 	rm -f $(PLUGIN_SO)
