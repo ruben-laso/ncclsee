@@ -13,9 +13,14 @@
 
 
 #define __hidden __attribute__ ((visibility("hidden")))
-#define GROUP_POOL_SIZE 128
-#define COLL_POOL_SIZE 128
-#define PROXY_POOL_SIZE 128
+#define GROUP_POOL_SIZE 64
+#define COLL_POOL_SIZE 64
+#define P2P_POOL_SIZE 64
+#define PROXY_POOL_SIZE 64
+
+#define MAX_CHANNELS                     32
+#define MAX_STEPS                        16
+#define MAX_OPS                          16 // Up to 64K ranks for PAT
 
 
 static const char plugin_name[32] = "A Fools Hope";
@@ -39,7 +44,21 @@ static const char* nccl_coll_names[nccl_num_colls] = {
     "ReduceScatter",
     "AllGather",
     "AllToAll",
-    "Unknown"
+    "Unknown_Collective",
+};
+
+
+enum nccl_p2p {
+    nccl_p2p_send,
+    nccl_p2p_recv,
+    nccl_p2p_unknown, // For unexpected cases
+    nccl_num_p2p // Keeps track of total primitives
+};
+
+static const char* nccl_p2p_names[nccl_num_p2p] = {
+    "Send",
+    "Recv",
+    "Uknown_P2P"
 };
 
 /* static const int groupPoolSize = 128; */
@@ -50,18 +69,22 @@ static struct {
     uint64_t count;
     uint64_t bytes;
     double time;
+  // We may add more things here
 } stats[nccl_num_colls] = {0};
 
-struct group;
+
+static struct {
+    uint64_t count;
+    uint64_t typecount;
+    double time;
+} stats_p2p[nccl_num_p2p] = {0};
+
+static struct {
+    uint64_t count;
+    double time;
+} stats_group = {0};
+
 struct context;
-struct proxyOp;
-
-struct proxyOp {
-  uint8_t type;           // ncclProfileProxyOp
-  struct collective* parent; // The collective that spawned this proxy op
-  pid_t pid;
-};
-
 
 struct group {
   uint8_t type;
@@ -71,13 +94,38 @@ struct group {
   double stopTs;
 };
 
-struct collective {
-  uint8_t type;
-  struct group* parent;
-  int refCount;
-  enum nccl_colls name;   // Index in the collective name array
+
+// task level event base structure
+struct taskEventBase {
+  uint8_t type;                     // event type: collective/p2p
+  //int rank;                         // rank of the operation in NCCL communicator
+  //uint64_t commHash;                // communicator identifier
+  const char* func;                 // ncclFunc*
+  int refCount;                     // number of references for this operation
+  struct group* parent;             // parent event group
   double startTs;
   double stopTs;
+};
+
+
+struct proxyOp {
+  uint8_t type;           // ncclProfileProxyOp
+  pid_t pid;
+  struct taskEventBase* parent;     // parent event p2p/collective
+};
+
+struct collective {
+  struct taskEventBase base;
+  enum nccl_colls name;   // Index in the collective name array
+  // struct proxyOp send[MAX_CHANNELS][MAX_OPS];// array of send proxy operation events
+  // struct proxyOp recv[MAX_CHANNELS][MAX_OPS];// array of recv proxy operation events
+  // int nProxyOps[MAX_CHANNELS];
+};
+
+struct p2p {
+  struct taskEventBase base;
+  enum nccl_p2p name;
+  // struct proxyOp op[MAX_CHANNELS];
 };
 
 
@@ -87,6 +135,8 @@ struct context {
  struct group groupPool[GROUP_POOL_SIZE];
  int collIndex;
  struct collective collPool[COLL_POOL_SIZE];
+ int p2pIndex;
+ struct p2p p2pPool[P2P_POOL_SIZE];
  int proxyIndex;
  struct proxyOp proxyPool[PROXY_POOL_SIZE];
 };
@@ -153,6 +203,7 @@ __hidden ncclResult_t Profiler_Init(void** context, int* eActivationMask) {
   }
   ctx->groupIndex = 0;
   ctx->collIndex = 0;
+  ctx->p2pIndex = 0;
   ctx->proxyIndex = 0;
   // Assign the context to the output parameter
   *context = ctx;
@@ -175,15 +226,20 @@ __hidden ncclResult_t Profiler_Finalize(void* context) {
 /* fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " Bytes\n", "Unknown:", unknownCount, unknownBytes); */
 /* fprintf(stderr, "=========================================================\n\n"); */
 
+
   fprintf(stderr, "\n=================== NCCL PROFILING SUMMARY ===================\n");
-  fprintf(stderr, "%-18s %-12s %-15s %-15s\n",
+
+  fprintf(stderr, "%-18s %-12s %-20s %-15s\n",
           "Collective Type", "Calls", "Bytes Transferred", "Total Time (us)");
   fprintf(stderr, "--------------------------------------------------------------------------\n");
 
   for (int i = 0; i < nccl_num_colls; i++) {
-    fprintf(stderr, "%-18s %-12" PRIu64 " %-15" PRIu64 " %-15.6f\n",
+    if (stats[i].count == 0) continue;
+    fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " %-15.6f\n",
             nccl_coll_names[i], stats[i].count, stats[i].bytes, stats[i].time);
   }
+  fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " %-15.6f\n","Group", stats_group.count, (uint64_t)0, stats_group.time);
+
 
   fprintf(stderr, "==========================================================================\n\n");
 
@@ -197,9 +253,9 @@ __hidden ncclResult_t Profiler_Finalize(void* context) {
 
 
 ncclResult_t Profiler_Event_Start(void* context, void** eHandle, ncclProfilerEventDescr_t* eDescr){
-
-    *eHandle = NULL;
-    struct context* ctx = (struct context*)context;
+  *eHandle = NULL;
+  struct context* ctx = (struct context*)context;
+  //fprintf(debug_file, "Profiler_Event_Start: %d\n", eDescr->type);
 
     if (eDescr->type == ncclProfileGroup) {
         /* struct group* event = (struct group*)malloc(sizeof(struct group)); */
@@ -212,10 +268,9 @@ ncclResult_t Profiler_Event_Start(void* context, void** eHandle, ncclProfilerEve
         event->ctx = ctx;
         event->type = ncclProfileGroup;
         event->startTs = gettime() - startTime;
+        __atomic_fetch_add(&stats_group.count, 1, __ATOMIC_RELAXED);
         *eHandle = event;
-    }
-
-    if (eDescr->type == ncclProfileColl) {
+    } else if (eDescr->type == ncclProfileColl) {
 
         struct group* parent = (struct group *)eDescr->parentObj;
         if (parent == NULL) return ncclSuccess;
@@ -223,57 +278,67 @@ ncclResult_t Profiler_Event_Start(void* context, void** eHandle, ncclProfilerEve
         int index = __atomic_fetch_add(&ctx->collIndex, 1, __ATOMIC_RELAXED) % COLL_POOL_SIZE;
         struct collective* event = &ctx->collPool[index];
 
-        event->type = ncclProfileColl;
+        event->base.type = ncclProfileColl;
         size_t trafficBytes = eDescr->coll.trafficBytes;
-        event->parent = (struct group*)eDescr->parentObj;
+        event->base.parent = parent;
         const char* name = eDescr->coll.func;
-        event->startTs = gettime() - startTime;
         __atomic_fetch_add(&parent->refCount, 1, __ATOMIC_RELAXED);
         *eHandle = event;
         if (strcmp(name, "AllReduce") == 0) {
           event->name = nccl_allreduce;
-          /* __atomic_fetch_add(&allReduceCount, 1, __ATOMIC_RELAXED); */
-          /* __atomic_fetch_add(&allReduceBytes, trafficBytes, __ATOMIC_RELAXED); */
         }
         else if (strcmp(name, "Broadcast") == 0) {
           event->name = nccl_broadcast;
-          /* __atomic_fetch_add(&broadcastCount, 1, __ATOMIC_RELAXED); */
-          /* __atomic_fetch_add(&broadcastBytes, trafficBytes, __ATOMIC_RELAXED); */
         }
         else if (strcmp(name, "Reduce") == 0) {
           event->name = nccl_reduce;
-          /* __atomic_fetch_add(&reduceCount, 1, __ATOMIC_RELAXED); */
-          /* __atomic_fetch_add(&reduceBytes, trafficBytes, __ATOMIC_RELAXED); */
         }
         else if (strcmp(name, "ReduceScatter") == 0) {
           event->name = nccl_reduce_scatter;
-          /* __atomic_fetch_add(&reduceScatterCount, 1, __ATOMIC_RELAXED); */
-          /* __atomic_fetch_add(&reduceScatterBytes, trafficBytes, __ATOMIC_RELAXED); */
         }
         else if (strcmp(name, "AllGather") == 0) {
           event->name = nccl_allgather;
-          /* __atomic_fetch_add(&allGatherCount, 1, __ATOMIC_RELAXED); */
-          /* __atomic_fetch_add(&allGatherBytes, trafficBytes, __ATOMIC_RELAXED); */
         }
         else if (strcmp(name, "AllToAll") == 0) {
           event->name = nccl_alltoall;
-          /* __atomic_fetch_add(&allToAllCount, 1, __ATOMIC_RELAXED); */
-          /* __atomic_fetch_add(&allToAllBytes, trafficBytes, __ATOMIC_RELAXED); */
         }
         // Keeping track of this for now for debugging purposes
         else {
           event->name = nccl_unknown;
-          /* __atomic_fetch_add(&unknownCount, 1, __ATOMIC_RELAXED); */
-          /* __atomic_fetch_add(&unknownBytes, trafficBytes, __ATOMIC_RELAXED); */
         }
         // It is better to update those now so we dont carry them around
         __atomic_fetch_add(&stats[event->name].count, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&stats[event->name].bytes, trafficBytes, __ATOMIC_RELAXED);
-    } else if (eDescr->type == ncclProfileProxyOp) {
-      // We will need to change this for p2p
-      struct collective* eventBase = (struct collective *)eDescr->parentObj;
+        event->base.startTs = gettime() - startTime;
+    } else if (eDescr->type == ncclProfileP2p) {
+      struct group* parent = (struct group *)eDescr->parentObj;
+      if (parent == NULL) return ncclSuccess;
+      int index = __atomic_fetch_add(&ctx->p2pIndex, 1, __ATOMIC_RELAXED) % P2P_POOL_SIZE;
+      struct p2p* event = &ctx->p2pPool[index];
+      event->base.type = ncclProfileP2p;
+      event->base.parent = parent;
+      *eHandle = event;
+      if (strcmp(eDescr->p2p.func, "Send") == 0) {
+        event->name = nccl_p2p_send;
+      }
+      else if (strcmp(eDescr->p2p.func, "Recv") == 0) {
+        event->name = nccl_p2p_recv;
+      }
+      else {
+        event->name = nccl_p2p_unknown;
+      }
+      __atomic_fetch_add(&stats_p2p[event->name].count, 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&stats_p2p[event->name].typecount, eDescr->p2p.count, __ATOMIC_RELAXED);
+      event->base.startTs = gettime() - startTime;
+
+
+
+    } else if (eDescr->type ==  ncclProfileProxyOp) {
+
+      //fprintf(debug_file, "ProxyOp\n");
+      struct taskEventBase* eventBase = (struct taskEventBase *)eDescr->parentObj;
       if (eventBase == NULL) return ncclSuccess;
-      fprintf(debug_file, "ProxyOp\n");
+      //fprintf(debug_file, "ProxyOp parent not NULL\n");
       if ( eDescr->proxyOp.pid != pid ){
         int index = __atomic_fetch_add(&ctx->proxyIndex, 1, __ATOMIC_RELAXED) % PROXY_POOL_SIZE;
         struct proxyOp* event = &ctx->proxyPool[index];
@@ -284,17 +349,27 @@ ncclResult_t Profiler_Event_Start(void* context, void** eHandle, ncclProfilerEve
         return ncclSuccess;
       }
 
-    if (eventBase->type == ncclProfileColl) {
-      // Cannot be NULL
-      struct collective* parent = (struct collective *)eDescr->parentObj;
-      int index = __atomic_fetch_add(&ctx->proxyIndex, 1, __ATOMIC_RELAXED) % PROXY_POOL_SIZE;
-      struct proxyOp* event = &ctx->proxyPool[index];
-      event->type = ncclProfileProxyOp;
-      event->pid = eDescr->proxyOp.pid;
-      event->parent = parent;
-      __atomic_fetch_add(&parent->refCount, 1, __ATOMIC_RELAXED);
-      *eHandle = event;
-    }
+      if (eventBase->type == ncclProfileColl) {
+        // Cannot be NULL
+        struct collective* parent = (struct collective *)eDescr->parentObj;
+        int index = __atomic_fetch_add(&ctx->proxyIndex, 1, __ATOMIC_RELAXED) % PROXY_POOL_SIZE;
+        struct proxyOp* event = &ctx->proxyPool[index];
+        event->type = ncclProfileProxyOp;
+        event->pid = eDescr->proxyOp.pid;
+        event->parent = eventBase;
+        __atomic_fetch_add(&parent->base.refCount, 1, __ATOMIC_RELAXED);
+        *eHandle = event;
+      }
+      else{
+        struct p2p* parent = (struct p2p *)eDescr->parentObj;
+        int index = __atomic_fetch_add(&ctx->proxyIndex, 1, __ATOMIC_RELAXED) % PROXY_POOL_SIZE;
+        struct proxyOp* event = &ctx->proxyPool[index];
+        event->type = ncclProfileProxyOp;
+        event->pid = eDescr->proxyOp.pid;
+        event->parent = eventBase;
+        __atomic_fetch_add(&parent->base.refCount, 1, __ATOMIC_RELAXED);
+        *eHandle = event;
+      }
     }
 
     return ncclSuccess;
@@ -308,23 +383,35 @@ static void updateEvent(void* handle) {
     uint8_t type = *(uint8_t*)handle;
     if (type == ncclProfileGroup){
       struct group* event = (struct group *)handle;
-      __atomic_sub_fetch(&event->refCount, 1, __ATOMIC_RELAXED);
-      // We are not measuring group time yet
-      /* if (__atomic_sub_fetch(&event->refCount, 1, __ATOMIC_RELAXED) == 0) { */
-      /*    event->stopTs = gettime() - startTime; */
-      /* } */
+      if (__atomic_sub_fetch(&event->refCount, 1, __ATOMIC_RELAXED) == 0) {
+         event->stopTs = gettime() - startTime;
+         double duration = event->stopTs - event->startTs;
+         stats_group.time += duration;
+      }
     } else if (type == ncclProfileColl) {
       struct collective* event = (struct collective *)handle;
-      if (__atomic_sub_fetch(&event->refCount, 1, __ATOMIC_RELAXED) == 0) {
-        event->stopTs = gettime() - startTime;
-        double duration = event->stopTs - event->startTs;
+      if (__atomic_sub_fetch(&event->base.refCount, 1, __ATOMIC_RELAXED) == 0) {
+        event->base.stopTs = gettime() - startTime;
+        double duration = event->base.stopTs - event->base.startTs;
         // Update the time in stats
-        fprintf(debug_file, "Collective %s took %lf us\n", nccl_coll_names[event->name], duration);
+        //fprintf(debug_file, "Collective %s took %lf us\n", nccl_coll_names[event->name], duration);
         stats[event->name].time += duration;
-        updateEvent(event->parent);
+        updateEvent(event->base.parent);
         return;
       }
-    } else if (type == ncclProfileProxyOp) {
+    } else if ( type == ncclProfileP2p ) {
+      struct p2p* event = (struct p2p *)handle;
+      if (__atomic_sub_fetch(&event->base.refCount, 1, __ATOMIC_RELAXED) == 0) {
+        event->base.stopTs = gettime() - startTime;
+        double duration = event->base.stopTs - event->base.startTs;
+        // Update the time in stats
+        //fprintf(debug_file, "P2P %s took %lf us\n", nccl_p2p_names[event->name], duration);
+        stats_p2p[event->name].time += duration;
+        updateEvent(event->base.parent);
+        return;
+      }
+    }
+    else if (type == ncclProfileProxyOp) {
       struct proxyOp* event = (struct proxyOp *)handle;
       // We are not measuring proxy ops time yet
       updateEvent(event->parent);
@@ -333,29 +420,34 @@ static void updateEvent(void* handle) {
 
 __hidden ncclResult_t Profiler_Event_Stop(void* eHandle) {
   if (eHandle == NULL) return ncclSuccess;
+
   uint8_t type = *(uint8_t*)eHandle;
 
   if (type == ncclProfileGroup) {
-    //struct group* event = (struct group*) eHandle;
-    //event->stopTs = getTime() - startTime;
+    struct group* event = (struct group*) eHandle;
+    event->stopTs = gettime() - startTime;
+    stats_group.time += event->stopTs - event->startTs;
+    // Update the time in case proxy ops are used
+    event->startTs = event->stopTs;
     return ncclSuccess;
   }
   else if (type == ncclProfileColl) {
     struct collective* event = (struct collective*) eHandle;
-    event->stopTs = gettime() -startTime;
-    double duration = event->stopTs - event->startTs;
-    stats[event->name].time += duration;
+    event->base.stopTs = gettime() -startTime;
+    stats[event->name].time += event->base.stopTs - event->base.startTs;
+    // Update the time in case proxy ops are used
+    event->base.startTs = event->base.stopTs;
     return ncclSuccess;
   }
-  else if (type == ncclProfileProxyOp) {
-    //struct proxyOp* event = (struct proxyOp*) eHandle;
-    // event->stopTs = getTime()- startTime;
-    // Now that the proxy op is done, finalize it by calling updateEvent
-    updateEvent(eHandle);
+  else if (type == ncclProfileP2p) {
+    struct p2p* event = (struct p2p*) eHandle;
+    event->base.stopTs = gettime()- startTime;
+    stats_p2p[event->name].time +=  event->base.stopTs - event->base.startTs;
+    // Update the time in case proxy ops are used
+    event->base.startTs = event->base.stopTs;
     return ncclSuccess;
   }
 
-  // If other types exist such as ncclProfileP2p, we can add them here
   updateEvent(eHandle);
   return ncclSuccess;
 }
