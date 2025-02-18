@@ -10,6 +10,9 @@
 #include <stdbool.h>
 #include <x86intrin.h>
 #include <stdatomic.h>
+#include <cuda.h>
+#include <cuda_runtime_api.h>
+#include <cupti.h>
 #include "profiler.h"
 
 
@@ -18,10 +21,12 @@
 #define COLL_POOL_SIZE 64
 #define P2P_POOL_SIZE 64
 #define PROXY_POOL_SIZE 64
+#define CUPTI_BUFFER_SIZE 4*1024
 
 #define MAX_CHANNELS                     32
 #define MAX_STEPS                        16
 #define MAX_OPS                          16 // Up to 64K ranks for PAT
+
 
 
 static const char plugin_name[32] = "A Fools Hope";
@@ -41,8 +46,8 @@ enum nccl_colls {
 static const char* nccl_coll_names[nccl_num_colls] = {
     "AllReduce",
     "Broadcast",
-    "Reduce",
     "ReduceScatter",
+    "Reduce",
     "AllGather",
     "AllToAll",
     "Unknown_Collective",
@@ -142,6 +147,8 @@ struct context {
  struct proxyOp proxyPool[PROXY_POOL_SIZE];
 };
 
+uint8_t cupti_buffer[CUPTI_BUFFER_SIZE]; // 32KB buffer for CUPTI activity records.
+
 static int initialized;             // initialization counter for profiler
 static FILE *debug_file = NULL;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -150,6 +157,8 @@ static double startTime;
 
 
 static double freq = -1;
+
+
 
 __hidden void calibrate() {
   struct timeval tv;
@@ -181,6 +190,62 @@ void atomic_add_double(_Atomic double *target, double increment) {
         current = atomic_load(target);
         desired = current + increment;
     } while (!atomic_compare_exchange_weak(target, &current, desired));
+}
+
+
+#define CUPTI_CALL(call)                                                     \
+    do {                                                                     \
+        CUptiResult _status = call;                                          \
+        if (_status != CUPTI_SUCCESS) {                                      \
+            const char *errstr;                                              \
+            cuptiGetResultString(_status, &errstr);                          \
+            fprintf(stderr, "%s:%d: error: function %s failed with error %s.\n", \
+                    __FILE__, __LINE__, #call, errstr);                      \
+            exit(-1);                                                        \
+        }                                                                    \
+    } while (0)
+
+// CUPTI callback: Allocate a buffer for activity records.
+void CUPTIAPI bufferRequested(uint8_t **buffer, size_t *size, size_t *maxNumRecords) {
+    *size = CUPTI_BUFFER_SIZE;
+    *buffer = (uint8_t *) malloc(*size);
+    //*buffer = cupti_buffer;
+    if (*buffer == NULL) {
+        fprintf(stderr, "Error: unable to allocate CUPTI buffer\n");
+        exit(-1);
+    }
+    *maxNumRecords = 0;
+}
+
+// CUPTI callback: Process the completed buffer.
+void CUPTIAPI bufferCompleted(CUcontext context, uint32_t streamId,
+                              uint8_t *buffer, size_t size, size_t validSize) {
+    CUpti_Activity *record = NULL;
+    CUptiResult status = CUPTI_SUCCESS;
+    printf("Call to bufferCompleted\n");
+    // Process all records in the buffer.
+    do {
+        status = cuptiActivityGetNextRecord(buffer, validSize, &record);
+        if (status == CUPTI_ERROR_INVALID_PARAMETER)
+          break;
+        if (status == CUPTI_SUCCESS ) {
+            if (record->kind == CUPTI_ACTIVITY_KIND_KERNEL) {
+                CUpti_ActivityKernel4 *kernel = (CUpti_ActivityKernel4 *) record;
+                /* printf("Kernel %s: start %llu ns, end %llu ns, duration %llu ns\n", */
+                /*        kernel->name, */
+                /*        (unsigned long long) kernel->start, */
+                /*        (unsigned long long) kernel->end, */
+                /*        (unsigned long long) (kernel->end - kernel->start)); */
+
+            }
+        } else if (status == CUPTI_ERROR_MAX_LIMIT_REACHED) {
+            break;
+        } else {
+            fprintf(stderr, "Error: cuptiActivityGetNextRecord failed: %d\n", status);
+            break;
+        }
+    } while (1);
+    free(buffer);
 }
 
 __hidden ncclResult_t Profiler_Init(void** context, int* eActivationMask) {
@@ -219,11 +284,17 @@ __hidden ncclResult_t Profiler_Init(void** context, int* eActivationMask) {
   // Assign the context to the output parameter
   *context = ctx;
 
+  // Initialize CUPTI to record kernel events
+  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_KERNEL));
+  CUPTI_CALL(cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted));
 
   return ncclSuccess;
 }
 
 __hidden ncclResult_t Profiler_Finalize(void* context) {
+
+
+  CUPTI_CALL(cuptiActivityFlushAll(0));
 
   fprintf(stderr, "\n=================== NCCL PROFILING SUMMARY ===================\n");
 
@@ -243,7 +314,8 @@ __hidden ncclResult_t Profiler_Finalize(void* context) {
 
 
   struct context* ctx = (struct context*)context;
-  free(ctx);
+  if (ctx != NULL)
+    free(ctx);
   if (debug_file) fclose(debug_file);
   return ncclSuccess;
 }
@@ -426,6 +498,7 @@ __hidden ncclResult_t Profiler_Event_Stop(void* eHandle) {
   fflush(debug_file);
 #endif
 
+
   if (type == ncclProfileGroup) {
     struct group* event = (struct group*) eHandle;
     event->stopTs = gettime();
@@ -444,6 +517,7 @@ __hidden ncclResult_t Profiler_Event_Stop(void* eHandle) {
     event->base.stopTs = gettime();
     // Update the time in collective stats atomically
     atomic_add_double(&stats[event->name].time, event->base.stopTs - event->base.startTs);
+
     // Update the time in case proxy ops are used
     // event->base.startTs = event->base.stopTs;
     return ncclSuccess;

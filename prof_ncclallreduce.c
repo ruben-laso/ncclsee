@@ -1,0 +1,92 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <mpi.h>
+#include <cuda.h>
+#include <cuda_runtime_api.h>
+#include <nccl.h>
+
+int main(int argc, char *argv[]) {
+    // Initialize MPI.
+    MPI_Init(&argc, &argv);
+    int rank, nRanks;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &nRanks);
+
+    // Set the CUDA device based on MPI rank.
+    cudaSetDevice(rank);
+    struct cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, rank);
+    printf("MPI Rank %d using CUDA Device: %s\n", rank, prop.name);
+
+    // Wait for user input to proceed.
+    /* if (rank == 0) { */
+    /*     printf("Press Enter to continue...\n"); */
+    /*     getchar(); */
+    /* } */
+    /* MPI_Barrier(MPI_COMM_WORLD); */
+
+    // Initialize CUPTI to record kernel activities.
+    /* CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_KERNEL)); */
+    /* CUPTI_CALL(cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted)); */
+
+    // Initialize NCCL.
+    ncclUniqueId id;
+    if (rank == 0) {
+        ncclGetUniqueId(&id);
+    }
+    // Broadcast the NCCL unique ID to all ranks.
+    MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD);
+    ncclComm_t comm;
+    ncclCommInitRank(&comm, nRanks, id, rank);
+
+    // Allocate device memory.
+    const size_t count = 33554432;
+    float *sendbuff, *recvbuff;
+    cudaMalloc((void **)&sendbuff, count * sizeof(float));
+    cudaMalloc((void **)&recvbuff, count * sizeof(float));
+
+    // Initialize the send buffer with some values on the host.
+    float *hostBuffer = (float*) malloc(count * sizeof(float));
+    float base = (float)(rank*count);
+    for (size_t i = 0; i < count; i++) {
+        hostBuffer[i] = (float) (i) + base; // Distinguish data per rank.
+    }
+    cudaMemcpy(sendbuff, hostBuffer, count * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Optionally clear the receive buffer.
+    cudaMemset(recvbuff, 0, count * sizeof(float));
+
+    // Perform NCCL AllReduce (summing across ranks).
+    for(int i = 0; i < 3; i++) {
+        ncclAllReduce(sendbuff, recvbuff, count, ncclFloat, ncclSum, comm, cudaStreamDefault);
+    }
+    // Synchronize device to ensure the AllReduce (and its kernels) complete.
+    cudaDeviceSynchronize();
+
+    // Flush CUPTI buffers to process any remaining activity records.
+     /* CUPTI_CALL(cuptiActivityFlushAll(0)); */
+
+    // Verify the NCCL AllReduce result.
+    float *host_recv = (float*) malloc(count * sizeof(float));
+    cudaMemcpy(host_recv, recvbuff, count * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Print the first 10 elements of the result.
+    printf("MPI Rank %d: First 5 elements after AllReduce:\n", rank);
+    for (int i = 0; i < 5; i++) {
+        printf("%f ", host_recv[i]);
+    }
+    printf("\n");
+
+    // Cleanup resources.
+    ncclCommDestroy(comm);
+    free(host_recv);
+    free(hostBuffer);
+    cudaFree(sendbuff);
+    cudaFree(recvbuff);
+
+    // Finalize MPI.
+    MPI_Finalize();
+
+    return 0;
+}
+
