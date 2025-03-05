@@ -417,6 +417,10 @@ ncclResult_t Profiler_Event_Start(void* context, void** eHandle, ncclProfilerEve
         else {
           event->name = nccl_unknown;
         }
+#ifdef DEBUG
+        fprintf(debug_file, "Datatype %s\n", eDescr->coll.datatype);
+        fflush(debug_file);
+#endif
         // It is better to update those now so we dont carry them around
         __atomic_fetch_add(&stats[event->name].count, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&stats[event->name].bytes, trafficBytes, __ATOMIC_RELAXED);
