@@ -222,7 +222,7 @@ void CUPTIAPI bufferCompleted(CUcontext context, uint32_t streamId,
                               uint8_t *buffer, size_t size, size_t validSize) {
     CUpti_Activity *record = NULL;
     CUptiResult status = CUPTI_SUCCESS;
-    printf("Call to bufferCompleted\n");
+    //printf("Call to bufferCompleted\n");
     // Process all records in the buffer.
     do {
         status = cuptiActivityGetNextRecord(buffer, validSize, &record);
@@ -231,11 +231,11 @@ void CUPTIAPI bufferCompleted(CUcontext context, uint32_t streamId,
         if (status == CUPTI_SUCCESS ) {
             if (record->kind == CUPTI_ACTIVITY_KIND_KERNEL) {
                 CUpti_ActivityKernel4 *kernel = (CUpti_ActivityKernel4 *) record;
-                /* printf("Kernel %s: start %llu ns, end %llu ns, duration %llu ns\n", */
-                /*        kernel->name, */
-                /*        (unsigned long long) kernel->start, */
-                /*        (unsigned long long) kernel->end, */
-                /*        (unsigned long long) (kernel->end - kernel->start)); */
+                printf("Kernel %s: start %llu ns, end %llu ns, duration %llu ns\n",
+                       kernel->name,
+                       (unsigned long long) kernel->start,
+                       (unsigned long long) kernel->end,
+                       (unsigned long long) (kernel->end - kernel->start));
 
             }
         } else if (status == CUPTI_ERROR_MAX_LIMIT_REACHED) {
@@ -295,6 +295,7 @@ __hidden ncclResult_t Profiler_Finalize(void* context) {
 
 
   CUPTI_CALL(cuptiActivityFlushAll(0));
+  CUPTI_CALL(cuptiFinalize());
 
   fprintf(stderr, "\n=================== NCCL PROFILING SUMMARY ===================\n");
 
