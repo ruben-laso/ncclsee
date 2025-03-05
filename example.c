@@ -184,7 +184,56 @@ __hidden double gettime(void) {
   return __rdtsc() / freq;
 }
 
+static int getNCCLTypeSize(const char* datatype) {
+  if (datatype == NULL) {
+    // Error: datatype is NULL print error message
+    fprintf(stderr, "ncclsee Error: NULL datatype passed to getNCCLTypeSize\n");
+    // Return -1 to indicate error, the caller should check for this
+    return -1;
+  }
+  
+  // 1-byte types
+  if (strcmp(datatype, "ncclInt8") == 0 || 
+      strcmp(datatype, "ncclUint8") == 0 ||
+      strcmp(datatype, "ncclFloat8e4m3") == 0 ||
+      strcmp(datatype, "ncclFloat8e5m2") == 0) {
+      return 1;
+  }
+  
+  // 2-byte types
+  if (strcmp(datatype, "ncclFloat16") == 0 || 
+      strcmp(datatype, "ncclBfloat16") == 0) {
+      return 2;
+  }
+  
+  // 4-byte types
+  if (strcmp(datatype, "ncclInt32") == 0 || 
+      strcmp(datatype, "ncclUint32") == 0 ||
+      strcmp(datatype, "ncclFloat32") == 0) {
+      return 4;
+  }
+  
+  // 8-byte types
+  if (strcmp(datatype, "ncclInt64") == 0 || 
+      strcmp(datatype, "ncclUint64") == 0 ||
+      strcmp(datatype, "ncclFloat64") == 0) {
+      return 8;
+  }
+  
+  // Unknown type
+  fprintf(stderr, "ncclsee Error: Unknown datatype passed to getNCCLTypeSize\n");
+  return 0; // Default to 0 bytes for unknown types
+}
 
+// Find the appropriate bucket for a given byte size
+int choose_bucket(int64_t bytes) {
+  for (int index = 0; index < NUM_BUCKETS - 1; ++index) {
+      if (buckets[index] > bytes) {
+          return index;
+      }
+  }
+  return NUM_BUCKETS-1;
+}
 
 void atomic_add_double(_Atomic double *target, double increment) {
     double current;
@@ -417,6 +466,13 @@ ncclResult_t Profiler_Event_Start(void* context, void** eHandle, ncclProfilerEve
         else {
           event->name = nccl_unknown;
         }
+        int type_size = getNCCLTypeSize(eDescr->coll.datatype);
+        if (type_size == -1 || type_size == 0) {
+          fprintf(stderr, "ncclsee Profiler_Event_Start: Error getting type size\n");
+          // We need to clean up here in the future
+          return ncclInternalError;
+        }
+        size_t bufferSize = count * typeSize;
 #ifdef DEBUG
         fprintf(debug_file, "Datatype %s\n", eDescr->coll.datatype);
         fflush(debug_file);
