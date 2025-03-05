@@ -40,7 +40,7 @@ int main(int argc, char *argv[]) {
     ncclCommInitRank(&comm, nRanks, id, rank);
 
     // Allocate device memory.
-    const size_t count = 33554432;
+    size_t count = 33554432;
     float *sendbuff, *recvbuff;
     cudaMalloc((void **)&sendbuff, count * sizeof(float));
     cudaMalloc((void **)&recvbuff, count * sizeof(float));
@@ -63,6 +63,19 @@ int main(int argc, char *argv[]) {
     // Synchronize device to ensure the AllReduce (and its kernels) complete.
     cudaDeviceSynchronize();
 
+    cudaFree(sendbuff);
+    cudaFree(recvbuff);
+
+    // Perform NCCL AllReduce (summing across ranks).
+    count = 128;
+    cudaMalloc((void **)&sendbuff, count * sizeof(float));
+    cudaMalloc((void **)&recvbuff, count * sizeof(float));
+    cudaMemcpy(sendbuff, hostBuffer, count * sizeof(float), cudaMemcpyHostToDevice);
+    for(int i = 0; i < 1; i++) {
+        ncclAllReduce(sendbuff, recvbuff, count, ncclFloat, ncclSum, comm, cudaStreamDefault);
+    }
+    // Synchronize device to ensure the AllReduce (and its kernels) complete.
+    cudaDeviceSynchronize();
     // Flush CUPTI buffers to process any remaining activity records.
      /* CUPTI_CALL(cuptiActivityFlushAll(0)); */
 
@@ -81,8 +94,6 @@ int main(int argc, char *argv[]) {
     ncclCommDestroy(comm);
     free(host_recv);
     free(hostBuffer);
-    cudaFree(sendbuff);
-    cudaFree(recvbuff);
 
     // Finalize MPI.
     MPI_Finalize();

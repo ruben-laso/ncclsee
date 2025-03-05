@@ -159,6 +159,9 @@ static double startTime;
 static double freq = -1;
 
 
+// Subscribe to CUDA runtime API callbacks
+CUpti_SubscriberHandle subscriber;
+
 
 __hidden void calibrate() {
   struct timeval tv;
@@ -230,7 +233,7 @@ void CUPTIAPI bufferCompleted(CUcontext context, uint32_t streamId,
           break;
         if (status == CUPTI_SUCCESS ) {
             if (record->kind == CUPTI_ACTIVITY_KIND_KERNEL) {
-                CUpti_ActivityKernel4 *kernel = (CUpti_ActivityKernel4 *) record;
+                CUpti_ActivityKernel8 *kernel = (CUpti_ActivityKernel8 *) record;
                 printf("Kernel %s: start %llu ns, end %llu ns, duration %llu ns\n",
                        kernel->name,
                        (unsigned long long) kernel->start,
@@ -246,6 +249,37 @@ void CUPTIAPI bufferCompleted(CUcontext context, uint32_t streamId,
         }
     } while (1);
     free(buffer);
+}
+
+// Dont forget to register the function in Profiler_Init
+void CUPTIAPI cupti_callback_handler(void *userdata, CUpti_CallbackDomain domain,
+                                    CUpti_CallbackId cbid, const void *cbdata) {
+    const CUpti_CallbackData *cbInfo = (CUpti_CallbackData *)cbdata;
+
+    // Only process CUDA Runtime API calls
+    if (domain != CUPTI_CB_DOMAIN_RUNTIME_API) {
+        return;
+    }
+
+    // Check if this is a cudaDeviceSynchronize exit
+    if (cbid == CUPTI_RUNTIME_TRACE_CBID_cudaDeviceSynchronize_v3020 &&
+        cbInfo->callbackSite == CUPTI_API_EXIT) {
+
+        // Flush CUPTI activity data after synchronization
+        CUptiResult status = cuptiActivityFlushAll(0);
+        if (status != CUPTI_SUCCESS) {
+            const char *errstr;
+            cuptiGetResultString(status, &errstr);
+            fprintf(stderr, "Error flushing CUPTI activities after cudaDeviceSynchronize: %s\n", errstr);
+        }
+
+        // Process the flushed data here or in the bufferCompleted callback
+        // A good time to update timing statistics
+#ifdef DEBUG
+        fprintf(debug_file, "Flushed CUPTI activities after cudaDeviceSynchronize\n");
+        fflush(debug_file);
+#endif
+    }
 }
 
 __hidden ncclResult_t Profiler_Init(void** context, int* eActivationMask) {
@@ -284,6 +318,9 @@ __hidden ncclResult_t Profiler_Init(void** context, int* eActivationMask) {
   // Assign the context to the output parameter
   *context = ctx;
 
+  CUPTI_CALL(cuptiSubscribe(&subscriber, (CUpti_CallbackFunc)cupti_callback_handler, NULL));
+  CUPTI_CALL(cuptiEnableDomain(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API));
+
   // Initialize CUPTI to record kernel events
   CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_KERNEL));
   CUPTI_CALL(cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted));
@@ -295,6 +332,7 @@ __hidden ncclResult_t Profiler_Finalize(void* context) {
 
 
   CUPTI_CALL(cuptiActivityFlushAll(0));
+  CUPTI_CALL(cuptiUnsubscribe(subscriber));
   CUPTI_CALL(cuptiFinalize());
 
   fprintf(stderr, "\n=================== NCCL PROFILING SUMMARY ===================\n");
