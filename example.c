@@ -27,10 +27,13 @@
 #define MAX_STEPS                        16
 #define MAX_OPS                          16 // Up to 64K ranks for PAT
 
+#define NUM_BUCKETS 8
 
 
-static const char plugin_name[32] = "A Fools Hope";
+static const char plugin_name[32] = "NCCLSEE Profiler";
 static const int defaultEActivationMask = ncclProfileColl | ncclProfileP2p | ncclProfileProxyOp;
+
+static const int64_t buckets[NUM_BUCKETS-1] = {128,1024,8192,65536,262144,1048576,33554432};
 
 enum nccl_colls {
     nccl_allreduce,
@@ -158,6 +161,44 @@ static double startTime;
 
 static double freq = -1;
 
+// Simple correlation tracker
+typedef struct {
+    enum nccl_colls opType;
+    int bucketIndex;
+    bool valid;
+} CorrelationInfo;
+
+
+#define MAX_CORRELATIONS 1024 // Adjust based on expected concurrent operations
+static CorrelationInfo correlationTracker[MAX_CORRELATIONS] = {0};
+
+// Store correlation info
+void storeCorrelation(uint32_t correlationId, enum nccl_colls opType, int bucketIndex) {
+    // Simple modulo-based index to handle wrap-around
+    int index = correlationId % MAX_CORRELATIONS;
+    correlationTracker[index].opType = opType;
+    correlationTracker[index].bucketIndex = bucketIndex;
+    correlationTracker[index].valid = true;
+}
+
+// Retrieve correlation info
+bool getCorrelation(uint32_t correlationId, enum nccl_colls* opType, int* bucketIndex) {
+    int index = correlationId % MAX_CORRELATIONS;
+    if (correlationTracker[index].valid) {
+        *opType = correlationTracker[index].opType;
+        *bucketIndex = correlationTracker[index].bucketIndex;
+        return true;
+    }
+    return false;
+}
+
+// Generate a unique correlation ID
+uint32_t generateCorrelationId() {
+    static _Atomic uint32_t counter = 0;
+    return __atomic_fetch_add(&counter, 1, __ATOMIC_SEQ_CST);
+}
+
+
 
 // Subscribe to CUDA runtime API callbacks
 CUpti_SubscriberHandle subscriber;
@@ -181,7 +222,52 @@ __hidden void calibrate() {
 
 // returns current timestamp in useconds
 __hidden double gettime(void) {
-  return __rdtsc() / freq;
+  //return __rdtsc() / freq;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ( (ts.tv_sec * 1e6) + (ts.tv_nsec / 1e3) );
+}
+
+// return the size of a NCCL data type in bytes
+static int getNCCLTypeSize(const char* datatype) {
+  if (datatype == NULL) {
+    // Error: datatype is NULL print error message
+    fprintf(stderr, "ncclsee Error: NULL datatype passed to getNCCLTypeSize\n");
+    // Return -1 to indicate error, the caller should check for this
+    return -1;
+  }
+  
+  // 1-byte types
+  if (strcmp(datatype, "ncclInt8") == 0 || 
+      strcmp(datatype, "ncclUint8") == 0 ||
+      strcmp(datatype, "ncclFloat8e4m3") == 0 ||
+      strcmp(datatype, "ncclFloat8e5m2") == 0) {
+      return 1;
+  }
+  
+  // 2-byte types
+  if (strcmp(datatype, "ncclFloat16") == 0 || 
+      strcmp(datatype, "ncclBfloat16") == 0) {
+      return 2;
+  }
+  
+  // 4-byte types
+  if (strcmp(datatype, "ncclInt32") == 0 || 
+      strcmp(datatype, "ncclUint32") == 0 ||
+      strcmp(datatype, "ncclFloat32") == 0) {
+      return 4;
+  }
+  
+  // 8-byte types
+  if (strcmp(datatype, "ncclInt64") == 0 || 
+      strcmp(datatype, "ncclUint64") == 0 ||
+      strcmp(datatype, "ncclFloat64") == 0) {
+      return 8;
+  }
+  
+  // Unknown type
+  fprintf(stderr, "ncclsee Error: Unknown datatype passed to getNCCLTypeSize\n");
+  return 0; // Default to 0 bytes for unknown types
 }
 
 static int getNCCLTypeSize(const char* datatype) {
@@ -224,6 +310,33 @@ static int getNCCLTypeSize(const char* datatype) {
   fprintf(stderr, "ncclsee Error: Unknown datatype passed to getNCCLTypeSize\n");
   return 0; // Default to 0 bytes for unknown types
 }
+
+int get_nccl_coll_name(const char* name) {
+
+        if (strcmp(name, "AllReduce") == 0) {
+          return nccl_allreduce;
+        }
+        else if (strcmp(name, "Broadcast") == 0) {
+          return nccl_broadcast;
+        }
+        else if (strcmp(name, "Reduce") == 0) {
+          return nccl_reduce;
+        }
+        else if (strcmp(name, "ReduceScatter") == 0) {
+          return nccl_reduce_scatter;
+        }
+        else if (strcmp(name, "AllGather") == 0) {
+          return nccl_allgather;
+        }
+        else if (strcmp(name, "AllToAll") == 0) {
+          return nccl_alltoall;
+        }
+        // Keeping track of this for now for debugging purposes
+        else {
+          return nccl_unknown;
+        }
+}
+
 
 // Find the appropriate bucket for a given byte size
 int choose_bucket(int64_t bytes) {
@@ -281,13 +394,15 @@ void CUPTIAPI bufferCompleted(CUcontext context, uint32_t streamId,
         if (status == CUPTI_ERROR_INVALID_PARAMETER)
           break;
         if (status == CUPTI_SUCCESS ) {
-            if (record->kind == CUPTI_ACTIVITY_KIND_KERNEL) {
+            if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL) {
                 CUpti_ActivityKernel8 *kernel = (CUpti_ActivityKernel8 *) record;
-                printf("Kernel %s: start %llu ns, end %llu ns, duration %llu ns\n",
-                       kernel->name,
-                       (unsigned long long) kernel->start,
-                       (unsigned long long) kernel->end,
-                       (unsigned long long) (kernel->end - kernel->start));
+                /* printf("Kernel %s: start %llu ns, end %llu ns, duration %llu ns, id %u\n", */
+                /*        kernel->name, */
+                /*        (unsigned long long) kernel->start, */
+                /*        (unsigned long long) kernel->end, */
+                /*        (unsigned long long) (kernel->end - kernel->start), */
+                /*        kernel->correlationId); */
+
 
             }
         } else if (status == CUPTI_ERROR_MAX_LIMIT_REACHED) {
@@ -340,7 +455,7 @@ __hidden ncclResult_t Profiler_Init(void** context, int* eActivationMask) {
     str = getenv("NCCL_PROFILE_EVENT_MASK");
     __atomic_store_n(eActivationMask, str ? atoi(str) : defaultEActivationMask, __ATOMIC_RELAXED);
     pid = getpid();
-    calibrate();
+    //calibrate();
     startTime = gettime();
 
   }
@@ -351,7 +466,7 @@ __hidden ncclResult_t Profiler_Init(void** context, int* eActivationMask) {
   /* fprintf(stderr, "Profiler_Init: eActivationMask = %d\n", *eActivationMask); */
 #ifdef DEBUG
   char debug_file_name[64];
-  snprintf(debug_file_name, 64, "./fools_debug_%d.log", pid);
+  snprintf(debug_file_name, 64, "./ncclsee_debug_%d.log", pid);
   debug_file = fopen(debug_file_name, "a+");
 #endif
   // Allocate memory for the context
@@ -371,7 +486,8 @@ __hidden ncclResult_t Profiler_Init(void** context, int* eActivationMask) {
   CUPTI_CALL(cuptiEnableDomain(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API));
 
   // Initialize CUPTI to record kernel events
-  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_KERNEL));
+  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
+  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION));
   CUPTI_CALL(cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted));
 
   return ncclSuccess;
@@ -444,27 +560,11 @@ ncclResult_t Profiler_Event_Start(void* context, void** eHandle, ncclProfilerEve
         event->base.parent = parent;
         const char* name = eDescr->coll.func;
         __atomic_fetch_add(&parent->refCount, 1, __ATOMIC_RELAXED);
-        if (strcmp(name, "AllReduce") == 0) {
-          event->name = nccl_allreduce;
-        }
-        else if (strcmp(name, "Broadcast") == 0) {
-          event->name = nccl_broadcast;
-        }
-        else if (strcmp(name, "Reduce") == 0) {
-          event->name = nccl_reduce;
-        }
-        else if (strcmp(name, "ReduceScatter") == 0) {
-          event->name = nccl_reduce_scatter;
-        }
-        else if (strcmp(name, "AllGather") == 0) {
-          event->name = nccl_allgather;
-        }
-        else if (strcmp(name, "AllToAll") == 0) {
-          event->name = nccl_alltoall;
-        }
-        // Keeping track of this for now for debugging purposes
-        else {
-          event->name = nccl_unknown;
+        int type_size = getNCCLTypeSize(eDescr->coll.datatype);
+        if (type_size == -1 || type_size == 0) {
+          fprintf(stderr, "ncclsee Profiler_Event_Start: Error getting type size\n");
+          // We need to clean up here in the future
+          return ncclInternalError;
         }
         int type_size = getNCCLTypeSize(eDescr->coll.datatype);
         if (type_size == -1 || type_size == 0) {
@@ -472,7 +572,13 @@ ncclResult_t Profiler_Event_Start(void* context, void** eHandle, ncclProfilerEve
           // We need to clean up here in the future
           return ncclInternalError;
         }
-        size_t bufferSize = count * typeSize;
+        size_t count = eDescr->coll.count;
+        event->name = get_nccl_coll_name(name);
+        size_t bufferSize = count * type_size;
+
+        uint32_t correlationId = generateCorrelationId();
+        CUPTI_CALL(cuptiActivityPushExternalCorrelationId(CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2, correlationId));
+
 #ifdef DEBUG
         fprintf(debug_file, "Datatype %s\n", eDescr->coll.datatype);
         fflush(debug_file);
