@@ -34,7 +34,7 @@ static const int defaultEActivationMask = ncclProfileColl | ncclProfileP2p | ncc
 static const int64_t buckets[NUM_BUCKETS - 1] = {128, 1024, 8192, 65536, 262144, 1048576, 33554432};
 
 /* uint64_t timestamps[1024] = {0}; */
-/* uint64_t event_counter = 0; */
+uint32_t event_counter = 0;
 
 enum nccl_colls
 {
@@ -173,11 +173,11 @@ typedef struct
   bool valid;
 } CorrelationInfo;
 
-#define MAX_CORRELATIONS 1024 // Adjust based on expected concurrent operations
+#define MAX_CORRELATIONS 16384 // Adjust based on expected concurrent operations
 static CorrelationInfo correlationTracker[MAX_CORRELATIONS] = {0};
 
 // Store correlation info
-void storeCorrelation(uint32_t correlationId, enum nccl_colls opType, int bucketIndex)
+void storeCorrelation(uint64_t correlationId, enum nccl_colls opType, int bucketIndex)
 {
   // Simple modulo-based index to handle wrap-around
   int index = correlationId % MAX_CORRELATIONS;
@@ -191,7 +191,7 @@ void storeCorrelation(uint32_t correlationId, enum nccl_colls opType, int bucket
 }
 
 // Retrieve correlation info
-bool getCorrelation(uint32_t correlationId, enum nccl_colls *opType, int *bucketIndex)
+bool getCorrelation(uint64_t correlationId, enum nccl_colls *opType, int *bucketIndex)
 {
   int index = correlationId % MAX_CORRELATIONS;
   if (correlationTracker[index].valid)
@@ -204,10 +204,10 @@ bool getCorrelation(uint32_t correlationId, enum nccl_colls *opType, int *bucket
 }
 
 // Generate a unique correlation ID
-uint32_t generateCorrelationId()
+uint64_t generateCorrelationId()
 {
-  static _Atomic uint32_t counter = 0;
-  return __atomic_fetch_add(&counter, 1, __ATOMIC_SEQ_CST);
+  static uint64_t correlationId = 0;
+  return correlationId++;
 }
 
 // Subscribe to CUDA runtime API callbacks
@@ -240,10 +240,11 @@ __hidden double gettime(void)
   return ((ts.tv_sec * 1e6) + (ts.tv_nsec / 1e3));
 }
 
-uint64_t get_timestamp_ns() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+uint64_t get_timestamp_ns()
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
 static int getNCCLTypeSize(const char *datatype)
@@ -419,85 +420,43 @@ void CUPTIAPI bufferRequested(uint8_t **buffer, size_t *size, size_t *maxNumReco
 //   free(buffer);
 // }
 
-
 void CUPTIAPI bufferCompleted(CUcontext context, uint32_t streamId,
-                               uint8_t *buffer, size_t size, size_t validSize)
+                              uint8_t *buffer, size_t size, size_t validSize)
 {
-   CUpti_Activity *record = NULL;
-   CUptiResult status = CUPTI_SUCCESS;
-   // Map to temporarily store correlation info from this buffer
-   // Key: correlatedObjectId, Value: correlationId
-    /* uint64_t correlationMap[256] = {0}; // Simple approach, could use a hash map */
-    /* int correlationMapEntries = 0; */
+  CUpti_Activity *record = NULL;
 
-do
+  do
   {
-    status = cuptiActivityGetNextRecord(buffer, validSize, &record);
-    if ( status != CUPTI_SUCCESS || status == CUPTI_ERROR_INVALID_PARAMETER || status == CUPTI_ERROR_MAX_LIMIT_REACHED )
+    CUptiResult status = cuptiActivityGetNextRecord(buffer, validSize, &record);
+    if (status != CUPTI_SUCCESS)
       break;
-    /* if ( record->kind == CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION ) */
-    /* { */
-    /*   printf("External correlation\n"); */
-    /*   CUpti_ActivityExternalCorrelation *correlation = */
-    /*       (CUpti_ActivityExternalCorrelation *)record; */
-    /*   if (correlation->externalKind == CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2) */
-    /*   { */
-    /*     // Store the correlation ID mapping */
-    /*     if (correlationMapEntries < 256) */
-    /*     { */
-    /*       // The correlatedObjectId will match with a kernel's correlationId */
-    /*       correlationMap[correlationMapEntries * 2] = correlation->correlationId; */
-    /*       correlationMap[correlationMapEntries * 2 + 1] = correlation->externalId; */
-    /*       correlationMapEntries++; */
-    /*       printf("External correlation: correlationId %u, externalId %lu\n", */
-    /*              correlation->correlationId, correlation->externalId); */
-    /*     } */
-    /*     else{ */
-    /*       fprintf(stderr, "Error: correlationMapEntries exceeded 256\n"); */
-    /*     } */
-    /*   } */
-    /* } */
-    if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL)
-    {
-        CUpti_ActivityKernel8 *kernel = (CUpti_ActivityKernel8 *)record;
 
-        if( kernel->queued == CUPTI_TIMESTAMP_UNKNOWN ){
-          printf("Kernel %s: queued at unknown, started at %llu\n", kernel->name, (unsigned long long)kernel->start);
-        }
-        else{
-          printf("Kernel %s: queued at %llu, started at %llu\n", kernel->name, (unsigned long long)kernel->queued, (unsigned long long)kernel->start);
-        }
-        // Look up the correlation ID for this kernel
-        /* uint64_t correlationId = 0; */
-        /* for (int i = 0; i < correlationMapEntries; i++) */
-        /* { */
-        /*   if (correlationMap[i * 2] == kernel->correlationId) */
-        /*   { */
-        /*     correlationId = correlationMap[i * 2 + 1]; */
-        /*     break; */
-        /*   } */
-        /* } */
-        /* if (correlationId != 0) */
-        /* { */
-          // We found a matching correlation ID
-          /* enum nccl_colls opType; */
-          /* int bucketIndex; */
-            // Calculate kernel duration in microseconds
-            //double duration = (kernel->end - kernel->start) / 1000.0;
-            // Update the time stat for this operation type and bucket
-            // atomic_add_double(&stats[opType][bucketIndex].time, duration);
-            /* printf("Kernel %s: correlated to %s operation (bucket %d), duration %g us\n", */
-            /*        kernel->name, nccl_coll_names[opType], bucketIndex, duration); */
-            /* printf("Kernel %s: found correlation ID %u\n", */
-            /*        kernel->name, kernel->correlationId); */
-        }
-        /* else */
-        /* { */
-        /*   printf("Kernel %s: no correlation ID found\n", kernel->name); */
-        /* } */
-      /* } */
+    if (record->kind == CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION)
+    {
+      CUpti_ActivityExternalCorrelation *correlation =
+          (CUpti_ActivityExternalCorrelation *)record;
+
+      printf("EXTERNAL CORRELATION: correlationId=%u, externalId=%lu\n",
+             correlation->correlationId,
+             correlation->externalId);
+    }
+    else if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL)
+    {
+      CUpti_ActivityKernel5 *kernel = (CUpti_ActivityKernel5 *)record;
+
+      printf("KERNEL: name=%s, correlationId=%u\n",
+             kernel->name, kernel->correlationId);
+    }
+    else if (record->kind == CUPTI_ACTIVITY_KIND_RUNTIME)
+    {
+      CUpti_ActivityAPI *api = (CUpti_ActivityAPI *)record;
+
+      printf("RUNTIME API: cbid=%u, correlationId=%u\n",
+             api->cbid, api->correlationId);
+    }
   } while (1);
-free(buffer);
+
+  free(buffer);
 }
 
 // Dont forget to register the function in Profiler_Init
@@ -577,10 +536,15 @@ __hidden ncclResult_t Profiler_Init(void **context, int *eActivationMask)
   CUPTI_CALL(cuptiEnableDomain(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API));
 
   // Initialize CUPTI to record kernel events
-  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME));
+  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_DRIVER));
   CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
   CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION));
   CUPTI_CALL(cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted));
+
+  uint64_t correlationId = generateCorrelationId();
+  CUPTI_CALL(cuptiActivityPushExternalCorrelationId(
+      CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
+      correlationId));
 
   return ncclSuccess;
 }
@@ -667,11 +631,18 @@ ncclResult_t Profiler_Event_Start(void *context, void **eHandle, ncclProfilerEve
     event->name = get_nccl_coll_name(name);
     size_t bufferSize = count * type_size;
 
-    uint32_t correlationId = generateCorrelationId();
-    CUPTI_CALL(cuptiActivityPushExternalCorrelationId(CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2, correlationId));
-    event->correlationId = correlationId;
-
-
+    uint64_t correlationId;
+    if (event_counter == 0) {
+      // Pop correlation id and store it
+      CUPTI_CALL(cuptiActivityPopExternalCorrelationId(
+          CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
+          &correlationId));
+      storeCorrelation(correlationId, get_nccl_coll_name(event->name), choose_bucket(bufferSize));
+    }
+    correlationId = generateCorrelationId();
+    CUPTI_CALL(cuptiActivityPushExternalCorrelationId(
+        CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
+        correlationId));
 #ifdef DEBUG
     fprintf(debug_file, "Datatype %s\n", eDescr->coll.datatype);
     fflush(debug_file);
