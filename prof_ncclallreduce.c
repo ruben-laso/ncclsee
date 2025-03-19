@@ -40,7 +40,7 @@ int main(int argc, char *argv[]) {
     ncclCommInitRank(&comm, nRanks, id, rank);
 
     // Allocate device memory.
-    size_t count = 33554432;
+    size_t count = 16384;
     float *sendbuff, *recvbuff;
     cudaMalloc((void **)&sendbuff, count * sizeof(float));
     cudaMalloc((void **)&recvbuff, count * sizeof(float));
@@ -57,7 +57,7 @@ int main(int argc, char *argv[]) {
     cudaMemset(recvbuff, 0, count * sizeof(float));
 
     // Perform NCCL AllReduce (summing across ranks).
-    for(int i = 0; i < 3; i++) {
+    for(int i = 0; i < 2; i++) {
         ncclAllReduce(sendbuff, recvbuff, count, ncclFloat, ncclSum, comm, cudaStreamDefault);
     }
     // Synchronize device to ensure the AllReduce (and its kernels) complete.
@@ -72,7 +72,8 @@ int main(int argc, char *argv[]) {
     cudaMalloc((void **)&recvbuff, count * sizeof(float));
     cudaMemcpy(sendbuff, hostBuffer, count * sizeof(float), cudaMemcpyHostToDevice);
     for(int i = 0; i < 1; i++) {
-        ncclAllReduce(sendbuff, recvbuff, count, ncclFloat, ncclSum, comm, cudaStreamDefault);
+        ncclAllGather(sendbuff, recvbuff, count, ncclFloat, comm, cudaStreamDefault);
+        /* ncclAllReduce(sendbuff, recvbuff, count, ncclFloat, ncclSum, comm, cudaStreamDefault); */
     }
     // Synchronize device to ensure the AllReduce (and its kernels) complete.
     cudaDeviceSynchronize();
@@ -84,11 +85,11 @@ int main(int argc, char *argv[]) {
     cudaMemcpy(host_recv, recvbuff, count * sizeof(float), cudaMemcpyDeviceToHost);
 
     // Print the first 10 elements of the result.
-    printf("MPI Rank %d: First 5 elements after AllReduce:\n", rank);
-    for (int i = 0; i < 5; i++) {
-        printf("%f ", host_recv[i]);
-    }
-    printf("\n");
+    /* printf("MPI Rank %d: First 5 elements after AllReduce:\n", rank); */
+    /* for (int i = 0; i < 5; i++) { */
+    /*     printf("%f ", host_recv[i]); */
+    /* } */
+    /* printf("\n"); */
 
     // Cleanup resources.
     ncclCommDestroy(comm);

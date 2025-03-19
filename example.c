@@ -176,6 +176,7 @@ typedef struct
 #define MAX_CORRELATIONS 16384 // Adjust based on expected concurrent operations
 static CorrelationInfo correlationTracker[MAX_CORRELATIONS] = {0};
 
+
 // Store correlation info
 void storeCorrelation(uint64_t correlationId, enum nccl_colls opType, int bucketIndex)
 {
@@ -424,6 +425,8 @@ void CUPTIAPI bufferCompleted(CUcontext context, uint32_t streamId,
                               uint8_t *buffer, size_t size, size_t validSize)
 {
   CUpti_Activity *record = NULL;
+  uint64_t previous_external_id = 0;
+  uint32_t previous_correlation_id = 0;
 
   do
   {
@@ -436,16 +439,24 @@ void CUPTIAPI bufferCompleted(CUcontext context, uint32_t streamId,
       CUpti_ActivityExternalCorrelation *correlation =
           (CUpti_ActivityExternalCorrelation *)record;
 
-      printf("EXTERNAL CORRELATION: correlationId=%u, externalId=%lu\n",
-             correlation->correlationId,
-             correlation->externalId);
+      /* printf("EXTERNAL CORRELATION: correlationId=%u, externalId=%lu\n", */
+      /*        correlation->correlationId, */
+      /*        correlation->externalId); */
+      previous_external_id = correlation->externalId;
+      previous_correlation_id = correlation->correlationId;
     }
     else if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL)
     {
-      CUpti_ActivityKernel5 *kernel = (CUpti_ActivityKernel5 *)record;
+      CUpti_ActivityKernel8 *kernel = (CUpti_ActivityKernel8 *)record;
+      if (previous_correlation_id == kernel->correlationId){
+        printf("KERNEL: name=%s, Operation=%s, Bucket Index=%d\n",
+               kernel->name,nccl_coll_names[correlationTracker[previous_external_id].opType], correlationTracker[previous_external_id].bucketIndex);
+      }
+      else{
+        printf("KERNEL: name=%s, correlationId=%u, previous_external_id=%lu, previous_correlation_id=%u \n",
+             kernel->name, kernel->correlationId,previous_external_id,previous_correlation_id);
+      }
 
-      printf("KERNEL: name=%s, correlationId=%u\n",
-             kernel->name, kernel->correlationId);
     }
     else if (record->kind == CUPTI_ACTIVITY_KIND_RUNTIME)
     {
@@ -536,16 +547,16 @@ __hidden ncclResult_t Profiler_Init(void **context, int *eActivationMask)
   CUPTI_CALL(cuptiEnableDomain(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API));
 
   // Initialize CUPTI to record kernel events
+  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION));
   CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_DRIVER));
   CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
-  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION));
+
   CUPTI_CALL(cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted));
 
   uint64_t correlationId = generateCorrelationId();
   CUPTI_CALL(cuptiActivityPushExternalCorrelationId(
       CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
       correlationId));
-
   return ncclSuccess;
 }
 
@@ -630,19 +641,17 @@ ncclResult_t Profiler_Event_Start(void *context, void **eHandle, ncclProfilerEve
     size_t count = eDescr->coll.count;
     event->name = get_nccl_coll_name(name);
     size_t bufferSize = count * type_size;
-
     uint64_t correlationId;
-    if (event_counter == 0) {
-      // Pop correlation id and store it
+
       CUPTI_CALL(cuptiActivityPopExternalCorrelationId(
           CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
           &correlationId));
-      storeCorrelation(correlationId, get_nccl_coll_name(event->name), choose_bucket(bufferSize));
-    }
-    correlationId = generateCorrelationId();
-    CUPTI_CALL(cuptiActivityPushExternalCorrelationId(
-        CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
-        correlationId));
+      storeCorrelation(correlationId, event->name, choose_bucket(bufferSize));
+      event_counter++;
+      CUPTI_CALL(cuptiActivityPushExternalCorrelationId(CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
+                                                        correlationId));
+      generateCorrelationId();
+
 #ifdef DEBUG
     fprintf(debug_file, "Datatype %s\n", eDescr->coll.datatype);
     fflush(debug_file);

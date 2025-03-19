@@ -9,5 +9,8 @@ default: $(PLUGIN_SO)
 $(PLUGIN_SO): example.c
 	$(CC) $(INC) $(LIBS) $(CFLAGS) -g -fPIC -shared -o $@ -Wl,-soname,$(PLUGIN_SO) $^ -lnccl -lcudart -lcupti -latomic -pthread
 
+test: prof_ncclallreduce.c
+	mpicc -g -L$(CUDA_HOME)/lib64 -I$(CUDA_HOME)/include -I$(NCCL_HOME)/include -I/home/staff/vardas/spack/opt/spack/linux-debian11-zen2/gcc-10.2.1/cuda-11.8.0-6znhkjhz2vquzikacb3hbato2llnj3qi/extras/CUPTI/include/ -L$(NCCL_ROOT)/lib -L/home/staff/vardas/spack/opt/spack/linux-debian11-zen2/gcc-10.2.1/cuda-11.8.0-6znhkjhz2vquzikacb3hbato2llnj3qi/extras/CUPTI/lib64/ prof_ncclallreduce.c -lcudart -lnccl -lcupti
+
 clean:
 	rm -f $(PLUGIN_SO)
