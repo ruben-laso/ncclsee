@@ -40,7 +40,7 @@ int main(int argc, char *argv[]) {
     ncclCommInitRank(&comm, nRanks, id, rank);
 
     // Allocate device memory.
-    size_t count = 16384;
+    size_t count = 1000000;
     float *sendbuff, *recvbuff;
     cudaMalloc((void **)&sendbuff, count * sizeof(float));
     cudaMalloc((void **)&recvbuff, count * sizeof(float));
@@ -71,7 +71,7 @@ int main(int argc, char *argv[]) {
     cudaMalloc((void **)&sendbuff, count * sizeof(float));
     cudaMalloc((void **)&recvbuff, count * sizeof(float));
     cudaMemcpy(sendbuff, hostBuffer, count * sizeof(float), cudaMemcpyHostToDevice);
-    for(int i = 0; i < 1; i++) {
+    for(int i = 0; i < 3; i++) {
         ncclAllGather(sendbuff, recvbuff, count, ncclFloat, comm, cudaStreamDefault);
         /* ncclAllReduce(sendbuff, recvbuff, count, ncclFloat, ncclSum, comm, cudaStreamDefault); */
     }

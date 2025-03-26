@@ -14,6 +14,7 @@
 #include <cuda_runtime_api.h>
 #include <cupti.h>
 #include "profiler.h"
+#include "utarray.h"
 
 #define __hidden __attribute__((visibility("hidden")))
 #define GROUP_POOL_SIZE 64
@@ -80,14 +81,14 @@ static struct
   uint64_t bytes;
   _Atomic double time;
   // We may add more things here
-} stats[nccl_num_colls] = {0};
+} stats[nccl_num_colls][NUM_BUCKETS - 1] = {0};
 
 static struct
 {
   uint64_t count;
   uint64_t typecount;
   _Atomic double time;
-} stats_p2p[nccl_num_p2p] = {0};
+} stats_p2p[nccl_num_p2p][NUM_BUCKETS - 1] = {0};
 
 static struct
 {
@@ -130,7 +131,7 @@ struct collective
 {
   struct taskEventBase base;
   enum nccl_colls name; // Index in the collective name array
-  int correlationId;    // We probably dont need this
+  int bucket_index;    // We probably dont need this
   // struct proxyOp send[MAX_CHANNELS][MAX_OPS];// array of send proxy operation events
   // struct proxyOp recv[MAX_CHANNELS][MAX_OPS];// array of recv proxy operation events
   // int nProxyOps[MAX_CHANNELS];
@@ -140,6 +141,7 @@ struct p2p
 {
   struct taskEventBase base;
   enum nccl_p2p name;
+  int bucket_index;
   // struct proxyOp op[MAX_CHANNELS];
 };
 
@@ -174,6 +176,8 @@ typedef struct
 } CorrelationInfo;
 
 #define MAX_CORRELATIONS 16384 // Adjust based on expected concurrent operations
+
+// Simple correlation tracker
 static CorrelationInfo correlationTracker[MAX_CORRELATIONS] = {0};
 
 
@@ -381,45 +385,6 @@ void CUPTIAPI bufferRequested(uint8_t **buffer, size_t *size, size_t *maxNumReco
   *maxNumRecords = 0;
 }
 
-// // CUPTI callback: Process the completed buffer.
-// void CUPTIAPI bufferCompleted(CUcontext context, uint32_t streamId,
-//                               uint8_t *buffer, size_t size, size_t validSize)
-// {
-//   CUpti_Activity *record = NULL;
-//   CUptiResult status = CUPTI_SUCCESS;
-//   // printf("Call to bufferCompleted\n");
-//   //  Process all records in the buffer.
-//   do
-//   {
-//     status = cuptiActivityGetNextRecord(buffer, validSize, &record);
-//     if (status == CUPTI_ERROR_INVALID_PARAMETER)
-//       break;
-//     if (status == CUPTI_SUCCESS)
-//     {
-//       if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL)
-//       {
-//         CUpti_ActivityKernel8 *kernel = (CUpti_ActivityKernel8 *)record;
-//         CUpti_ActivityExternalCorrelation *correlation = (CUpti_ActivityExternalCorrelation *)record;
-//         printf("Kernel %s: start %llu ns, end %llu ns, duration %llu ns, id %lu\n",
-//                kernel->name,
-//                (unsigned long long)kernel->start,
-//                (unsigned long long)kernel->end,
-//                (unsigned long long)(kernel->end - kernel->start),
-//                correlation->externalId);
-//       }
-//     }
-//     else if (status == CUPTI_ERROR_MAX_LIMIT_REACHED)
-//     {
-//       break;
-//     }
-//     else
-//     {
-//       fprintf(stderr, "Error: cuptiActivityGetNextRecord failed: %d\n", status);
-//       break;
-//     }
-//   } while (1);
-//   free(buffer);
-// }
 
 void CUPTIAPI bufferCompleted(CUcontext context, uint32_t streamId,
                               uint8_t *buffer, size_t size, size_t validSize)
@@ -427,6 +392,16 @@ void CUPTIAPI bufferCompleted(CUcontext context, uint32_t streamId,
   CUpti_Activity *record = NULL;
   uint64_t previous_external_id = 0;
   uint32_t previous_correlation_id = 0;
+  /* int offset = -1; // We will use this to calculate the index ot the correlation_ids array */
+
+  /* UT_icd uint64t_icd = {sizeof(uint64_t), NULL, NULL, NULL}; */
+  /* UT_icd double_icd = {sizeof(double), NULL, NULL, NULL}; */
+
+  /* UT_array *correlation_ids, *kernel_data; */
+  /* utarray_new(correlation_ids, &uint64t_icd); */
+  /* utarray_new(kernel_data, &double_icd); */
+  /* utarray_reserve(correlation_ids, 128); */
+  /* utarray_reserve(kernel_data, 128); */
 
   do
   {
@@ -438,23 +413,34 @@ void CUPTIAPI bufferCompleted(CUcontext context, uint32_t streamId,
     {
       CUpti_ActivityExternalCorrelation *correlation =
           (CUpti_ActivityExternalCorrelation *)record;
-
       /* printf("EXTERNAL CORRELATION: correlationId=%u, externalId=%lu\n", */
       /*        correlation->correlationId, */
       /*        correlation->externalId); */
       previous_external_id = correlation->externalId;
       previous_correlation_id = correlation->correlationId;
+      /* if (offset = -1){ */
+      /*   offset = correlation->correlationId; */
+      /* } */
+      /* utarray_push_back(correlation_ids, &(correlation->externalId)); */
     }
     else if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL)
     {
       CUpti_ActivityKernel8 *kernel = (CUpti_ActivityKernel8 *)record;
       if (previous_correlation_id == kernel->correlationId){
-        printf("KERNEL: name=%s, Operation=%s, Bucket Index=%d\n",
-               kernel->name,nccl_coll_names[correlationTracker[previous_external_id].opType], correlationTracker[previous_external_id].bucketIndex);
+        // We only care about NCCL kernels
+        if (strstr(kernel->name, "nccl") == NULL)
+          continue;
+        enum nccl_colls opType;
+        int bucketIndex;
+        // Check if we have a valid correlation
+        getCorrelation(previous_external_id, &opType, &bucketIndex);
+        stats[opType][bucketIndex].time += (kernel->end - kernel->start);
+        /* printf("KERNEL: name=%s, Operation=%s, Bucket Index=%d\n", */
+        /*        kernel->name,nccl_coll_names[opType],bucketIndex); */
       }
       else{
-        printf("KERNEL: name=%s, correlationId=%u, previous_external_id=%lu, previous_correlation_id=%u \n",
-             kernel->name, kernel->correlationId,previous_external_id,previous_correlation_id);
+        /* printf("KERNEL: name=%s, correlationId=%u, previous_external_id=%lu, previous_correlation_id=%u \n", */
+        /*      kernel->name, kernel->correlationId,previous_external_id,previous_correlation_id); */
       }
 
     }
@@ -508,6 +494,21 @@ void CUPTIAPI cupti_callback_handler(void *userdata, CUpti_CallbackDomain domain
 __hidden ncclResult_t Profiler_Init(void **context, int *eActivationMask)
 {
 
+  CUPTI_CALL(cuptiSubscribe(&subscriber, (CUpti_CallbackFunc)cupti_callback_handler, NULL));
+  CUPTI_CALL(cuptiEnableDomain(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API));
+
+  // Initialize CUPTI to record kernel events
+  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION));
+  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_DRIVER));
+  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
+
+  CUPTI_CALL(cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted));
+
+  uint64_t correlationId = generateCorrelationId();
+  CUPTI_CALL(cuptiActivityPushExternalCorrelationId(
+      CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
+      correlationId));
+
   pthread_mutex_lock(&lock);
   if (__atomic_fetch_add(&initialized, 1, __ATOMIC_RELAXED) == 0)
   {
@@ -543,20 +544,6 @@ __hidden ncclResult_t Profiler_Init(void **context, int *eActivationMask)
   *context = ctx;
   /* CUPTI_CALL(cuptiActivityEnableLatencyTimestamps(1)); */
 
-  CUPTI_CALL(cuptiSubscribe(&subscriber, (CUpti_CallbackFunc)cupti_callback_handler, NULL));
-  CUPTI_CALL(cuptiEnableDomain(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API));
-
-  // Initialize CUPTI to record kernel events
-  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION));
-  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_DRIVER));
-  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
-
-  CUPTI_CALL(cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted));
-
-  uint64_t correlationId = generateCorrelationId();
-  CUPTI_CALL(cuptiActivityPushExternalCorrelationId(
-      CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
-      correlationId));
   return ncclSuccess;
 }
 
@@ -567,22 +554,52 @@ __hidden ncclResult_t Profiler_Finalize(void *context)
   CUPTI_CALL(cuptiUnsubscribe(subscriber));
   CUPTI_CALL(cuptiFinalize());
 
-  fprintf(stderr, "\n=================== NCCL PROFILING SUMMARY ===================\n");
 
-  fprintf(stderr, "%-18s %-12s %-20s %-15s\n",
-          "Collective Type", "Calls", "Bytes Transferred", "Total Time (us)");
-  fprintf(stderr, "--------------------------------------------------------------------------\n");
+fprintf(stderr, "\n=========================== NCCL PROFILING SUMMARY ===========================================\n");
+fprintf(stderr, "%-18s %-18s %-18s %-20s %-15s\n",
+        "Collective Type", "Bucket (B)", "Calls", "Bytes Transferred", "Total Time (us)");
+fprintf(stderr, "------------------------------------------------------------------------------------------------\n");
 
-  for (int i = 0; i < nccl_num_colls; i++)
-  {
-    if (stats[i].count == 0)
+for (int i = 0; i < nccl_num_colls; i++) {
+  uint64_t total_count = 0;
+  uint64_t total_bytes = 0;
+  double total_time = 0.0;
+
+  for (int j = 0; j < NUM_BUCKETS; j++) {
+    if (stats[i][j].count == 0)
       continue;
-    fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " %-15.6f\n",
-            nccl_coll_names[i], stats[i].count, stats[i].bytes, stats[i].time);
-  }
-  fprintf(stderr, "%-18s %-12" PRIu64 " %-20" PRIu64 " %-15.6f\n", "Group", stats_group.count, (uint64_t)0, stats_group.time);
 
-  fprintf(stderr, "==========================================================================\n\n");
+    // Determine bucket range string
+    char bucket_range[20];
+    if (j == 0) {
+      snprintf(bucket_range, sizeof(bucket_range), "0-%ld", buckets[0]);
+    } else if (j == NUM_BUCKETS - 1) {
+      snprintf(bucket_range, sizeof(bucket_range), ">%ld", buckets[NUM_BUCKETS - 2]);
+    } else {
+      snprintf(bucket_range, sizeof(bucket_range), "%ld-%ld", buckets[j-1], buckets[j]);
+    }
+
+    fprintf(stderr, "%-18s %-18s %-18" PRIu64 " %-20" PRIu64 " %-15.6f\n",
+            nccl_coll_names[i], bucket_range, stats[i][j].count,
+            stats[i][j].bytes, stats[i][j].time);
+
+    total_count += stats[i][j].count;
+    total_bytes += stats[i][j].bytes;
+    total_time += stats[i][j].time;
+  }
+
+  // Print totals for this collective type if any calls were made
+  if (total_count > 0) {
+    fprintf(stderr, "%-18s %-18s %-18" PRIu64 " %-20" PRIu64 " %-15.6f\n",
+            nccl_coll_names[i], "TOTAL", total_count, total_bytes, total_time);
+    fprintf(stderr, "------------------------------------------------------------------------------------------------\n");
+  }
+}
+
+fprintf(stderr, "%-18s %-18s %-18" PRIu64 " %-20" PRIu64 " %-15.6f\n",
+        "Group", "N/A", stats_group.count, (uint64_t)0, stats_group.time);
+fprintf(stderr, "==================================================================================================\n\n");
+
 
   struct context *ctx = (struct context *)context;
   if (ctx != NULL)
@@ -629,7 +646,9 @@ ncclResult_t Profiler_Event_Start(void *context, void **eHandle, ncclProfilerEve
     event->base.type = ncclProfileColl;
     size_t trafficBytes = eDescr->coll.trafficBytes;
     event->base.parent = parent;
+
     const char *name = eDescr->coll.func;
+
     __atomic_fetch_add(&parent->refCount, 1, __ATOMIC_RELAXED);
     int type_size = getNCCLTypeSize(eDescr->coll.datatype);
     if (type_size == -1 || type_size == 0)
@@ -638,15 +657,17 @@ ncclResult_t Profiler_Event_Start(void *context, void **eHandle, ncclProfilerEve
       // We need to clean up here in the future
       return ncclInternalError;
     }
+   
     size_t count = eDescr->coll.count;
     event->name = get_nccl_coll_name(name);
     size_t bufferSize = count * type_size;
     uint64_t correlationId;
+    int bucket_index = choose_bucket(bufferSize);
 
       CUPTI_CALL(cuptiActivityPopExternalCorrelationId(
           CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
           &correlationId));
-      storeCorrelation(correlationId, event->name, choose_bucket(bufferSize));
+      storeCorrelation(correlationId, event->name, bucket_index);
       event_counter++;
       CUPTI_CALL(cuptiActivityPushExternalCorrelationId(CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
                                                         correlationId));
@@ -657,8 +678,12 @@ ncclResult_t Profiler_Event_Start(void *context, void **eHandle, ncclProfilerEve
     fflush(debug_file);
 #endif
     // It is better to update those now so we dont carry them around
-    __atomic_fetch_add(&stats[event->name].count, 1, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&stats[event->name].bytes, trafficBytes, __ATOMIC_RELAXED);
+    /* __atomic_fetch_add(&stats[event->name].count, 1, __ATOMIC_RELAXED); */
+    /* __atomic_fetch_add(&stats[event->name].bytes, trafficBytes, __ATOMIC_RELAXED); */
+
+    __atomic_fetch_add(&stats[event->name][bucket_index].count, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&stats[event->name][bucket_index].bytes, trafficBytes, __ATOMIC_RELAXED);
+    event->bucket_index = bucket_index;
     event->base.startTs = gettime();
     *eHandle = event;
   }
@@ -671,6 +696,8 @@ ncclResult_t Profiler_Event_Start(void *context, void **eHandle, ncclProfilerEve
     struct p2p *event = &ctx->p2pPool[index];
     event->base.type = ncclProfileP2p;
     event->base.parent = parent;
+    const char *name = eDescr->coll.func;
+
     if (strcmp(eDescr->p2p.func, "Send") == 0)
     {
       event->name = nccl_p2p_send;
@@ -683,8 +710,29 @@ ncclResult_t Profiler_Event_Start(void *context, void **eHandle, ncclProfilerEve
     {
       event->name = nccl_p2p_unknown;
     }
-    __atomic_fetch_add(&stats_p2p[event->name].count, 1, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&stats_p2p[event->name].typecount, eDescr->p2p.count, __ATOMIC_RELAXED);
+
+
+    int type_size = getNCCLTypeSize(eDescr->coll.datatype);
+    size_t count = eDescr->coll.count;
+    event->name = get_nccl_coll_name(name);
+    size_t bufferSize = count * type_size;
+    uint64_t correlationId;
+    int bucket_index = choose_bucket(bufferSize);
+
+      CUPTI_CALL(cuptiActivityPopExternalCorrelationId(
+          CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
+          &correlationId));
+      storeCorrelation(correlationId, event->name, bucket_index);
+      event_counter++;
+      CUPTI_CALL(cuptiActivityPushExternalCorrelationId(CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
+                                                        correlationId));
+      generateCorrelationId();
+    
+    /* __atomic_fetch_add(&stats_p2p[event->name].count, 1, __ATOMIC_RELAXED); */
+    /* __atomic_fetch_add(&stats_p2p[event->name].typecount, eDescr->p2p.count, __ATOMIC_RELAXED); */
+
+    __atomic_fetch_add(&stats_p2p[event->name][bucket_index].count, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&stats_p2p[event->name][bucket_index].typecount, eDescr->p2p.count, __ATOMIC_RELAXED);
     event->base.startTs = gettime();
     *eHandle = event;
   }
@@ -760,7 +808,7 @@ static void updateEvent(void *handle)
       double duration = event->base.stopTs - event->base.startTs;
       // Update the time in stats
       // fprintf(debug_file, "Collective %s took %lf us\n", nccl_coll_names[event->name], duration);
-      stats[event->name].time += duration;
+      stats[event->name][event->bucket_index].time += duration;
       updateEvent(event->base.parent);
 
       return;
@@ -775,7 +823,7 @@ static void updateEvent(void *handle)
       double duration = event->base.stopTs - event->base.startTs;
       // Update the time in stats
       // fprintf(debug_file, "P2P %s took %lf us\n", nccl_p2p_names[event->name], duration);
-      stats_p2p[event->name].time += duration;
+      stats_p2p[event->name][event->bucket_index].time += duration;
       updateEvent(event->base.parent);
       return;
     }
@@ -818,7 +866,21 @@ __hidden ncclResult_t Profiler_Event_Stop(void *eHandle)
     struct collective *event = (struct collective *)eHandle;
     event->base.stopTs = gettime();
     // Update the time in collective stats atomically
-    atomic_add_double(&stats[event->name].time, event->base.stopTs - event->base.startTs);
+    atomic_add_double(&stats[event->name][event->bucket_index].time, event->base.stopTs - event->base.startTs);
+
+    /* int type_size = getNCCLTypeSize(eDescr->coll.datatype); */
+    /* if (type_size == -1 || type_size == 0) */
+    /* { */
+    /*   fprintf(stderr, "ncclsee Profiler_Event_Start: Error getting type size\n"); */
+    /*   // We need to clean up here in the future */
+    /*   return ncclInternalError; */
+    /* } */
+
+    /* size_t count = eDescr->coll.count; */
+    /* event->name = get_nccl_coll_name(name); */
+    /* size_t bufferSize = count * type_size; */
+    /* uint64_t correlationId; */
+    /* int bucket_index = choose_bucket(bufferSize); */
 
     // Update the time in case proxy ops are used
     // event->base.startTs = event->base.stopTs;
@@ -830,7 +892,7 @@ __hidden ncclResult_t Profiler_Event_Stop(void *eHandle)
   {
     struct p2p *event = (struct p2p *)eHandle;
     event->base.stopTs = gettime();
-    stats_p2p[event->name].time += event->base.stopTs - event->base.startTs;
+    stats_p2p[event->name][event->bucket_index].time += event->base.stopTs - event->base.startTs;
     // Update the time in case proxy ops are used
     // event->base.startTs = event->base.stopTs;
     return ncclSuccess;
