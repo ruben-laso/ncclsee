@@ -81,14 +81,14 @@ static struct
   uint64_t bytes;
   _Atomic double time;
   // We may add more things here
-} stats[nccl_num_colls][NUM_BUCKETS - 1] = {0};
+} stats[nccl_num_colls][NUM_BUCKETS] = {0};
 
 static struct
 {
   uint64_t count;
   uint64_t typecount;
   _Atomic double time;
-} stats_p2p[nccl_num_p2p][NUM_BUCKETS - 1] = {0};
+} stats_p2p[nccl_num_p2p][NUM_BUCKETS] = {0};
 
 static struct
 {
@@ -218,7 +218,7 @@ uint64_t generateCorrelationId()
 // Subscribe to CUDA runtime API callbacks
 CUpti_SubscriberHandle subscriber;
 
-__hidden void calibrate()
+__hidden void calibrate_us()
 {
   struct timeval tv;
   gettimeofday(&tv, NULL);
@@ -236,8 +236,22 @@ __hidden void calibrate()
   freq = timeCycles / time;
 }
 
+
+__hidden void calibrate() {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  uint64_t timeCycles = __rdtsc();
+  double time = - tv.tv_sec*1e9 - tv.tv_usec*1000; // Convert to nanoseconds
+  uint64_t total = 0ULL;
+  for (int i = 0; i < 10000; i++) total += __rdtsc();
+  gettimeofday(&tv, NULL);
+  timeCycles = __rdtsc() - timeCycles;
+  time += tv.tv_sec*1e9 + tv.tv_usec*1000; // Convert to nanoseconds
+  freq = timeCycles / time; // Now freq is cycles per nanosecond
+}
+
 // returns current timestamp in useconds
-__hidden double gettime(void)
+__hidden double gettime_us(void)
 {
   // return __rdtsc() / freq;
   struct timespec ts;
@@ -245,11 +259,12 @@ __hidden double gettime(void)
   return ((ts.tv_sec * 1e6) + (ts.tv_nsec / 1e3));
 }
 
-uint64_t get_timestamp_ns()
+uint64_t gettime()
 {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+  return __rdtsc() / freq;
+  // struct timespec ts;
+  // clock_gettime(CLOCK_MONOTONIC, &ts);
+  // return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
 static int getNCCLTypeSize(const char *datatype)
@@ -509,6 +524,8 @@ __hidden ncclResult_t Profiler_Init(void **context, int *eActivationMask)
       CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
       correlationId));
 
+  cudaDeviceSynchronize();
+
   pthread_mutex_lock(&lock);
   if (__atomic_fetch_add(&initialized, 1, __ATOMIC_RELAXED) == 0)
   {
@@ -517,7 +534,7 @@ __hidden ncclResult_t Profiler_Init(void **context, int *eActivationMask)
     str = getenv("NCCL_PROFILE_EVENT_MASK");
     __atomic_store_n(eActivationMask, str ? atoi(str) : defaultEActivationMask, __ATOMIC_RELAXED);
     pid = getpid();
-    // calibrate();
+    calibrate();
     startTime = gettime();
   }
   pthread_mutex_unlock(&lock);
@@ -557,7 +574,7 @@ __hidden ncclResult_t Profiler_Finalize(void *context)
 
 fprintf(stderr, "\n=========================== NCCL PROFILING SUMMARY ===========================================\n");
 fprintf(stderr, "%-18s %-18s %-18s %-20s %-15s\n",
-        "Collective Type", "Bucket (B)", "Calls", "Bytes Transferred", "Total Time (us)");
+        "Collective Type", "Bucket (B)", "Calls", "Bytes Transferred", "Total Time (ms)");
 fprintf(stderr, "------------------------------------------------------------------------------------------------\n");
 
 for (int i = 0; i < nccl_num_colls; i++) {
@@ -566,6 +583,8 @@ for (int i = 0; i < nccl_num_colls; i++) {
   double total_time = 0.0;
 
   for (int j = 0; j < NUM_BUCKETS; j++) {
+
+
     if (stats[i][j].count == 0)
       continue;
 
@@ -581,7 +600,7 @@ for (int i = 0; i < nccl_num_colls; i++) {
 
     fprintf(stderr, "%-18s %-18s %-18" PRIu64 " %-20" PRIu64 " %-15.6f\n",
             nccl_coll_names[i], bucket_range, stats[i][j].count,
-            stats[i][j].bytes, stats[i][j].time);
+            stats[i][j].bytes, stats[i][j].time / 1e6);
 
     total_count += stats[i][j].count;
     total_bytes += stats[i][j].bytes;
@@ -591,13 +610,13 @@ for (int i = 0; i < nccl_num_colls; i++) {
   // Print totals for this collective type if any calls were made
   if (total_count > 0) {
     fprintf(stderr, "%-18s %-18s %-18" PRIu64 " %-20" PRIu64 " %-15.6f\n",
-            nccl_coll_names[i], "TOTAL", total_count, total_bytes, total_time);
+            nccl_coll_names[i], "TOTAL", total_count, total_bytes, total_time / 1e6);
     fprintf(stderr, "------------------------------------------------------------------------------------------------\n");
   }
 }
 
 fprintf(stderr, "%-18s %-18s %-18" PRIu64 " %-20" PRIu64 " %-15.6f\n",
-        "Group", "N/A", stats_group.count, (uint64_t)0, stats_group.time);
+        "Group", "N/A", stats_group.count, (uint64_t)0, stats_group.time / 1e6);
 fprintf(stderr, "==================================================================================================\n\n");
 
 
@@ -664,9 +683,23 @@ ncclResult_t Profiler_Event_Start(void *context, void **eHandle, ncclProfilerEve
     uint64_t correlationId;
     int bucket_index = choose_bucket(bufferSize);
 
-      CUPTI_CALL(cuptiActivityPopExternalCorrelationId(
-          CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
-          &correlationId));
+    CUptiResult popStatus = cuptiActivityPopExternalCorrelationId(
+      CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
+      &correlationId);
+  
+  if (popStatus == CUPTI_ERROR_QUEUE_EMPTY) {
+      // Handle empty queue case - either skip correlation or generate new ID
+      correlationId = generateCorrelationId();
+  } else if (popStatus != CUPTI_SUCCESS) {
+      const char *errstr;
+      cuptiGetResultString(popStatus, &errstr);
+      fprintf(stderr, "Error popping correlation ID: %s\n", errstr);
+      return ncclInternalError;
+  }
+
+      // CUPTI_CALL(cuptiActivityPopExternalCorrelationId(
+      //     CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
+      //     &correlationId));
       storeCorrelation(correlationId, event->name, bucket_index);
       event_counter++;
       CUPTI_CALL(cuptiActivityPushExternalCorrelationId(CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
@@ -867,20 +900,6 @@ __hidden ncclResult_t Profiler_Event_Stop(void *eHandle)
     event->base.stopTs = gettime();
     // Update the time in collective stats atomically
     atomic_add_double(&stats[event->name][event->bucket_index].time, event->base.stopTs - event->base.startTs);
-
-    /* int type_size = getNCCLTypeSize(eDescr->coll.datatype); */
-    /* if (type_size == -1 || type_size == 0) */
-    /* { */
-    /*   fprintf(stderr, "ncclsee Profiler_Event_Start: Error getting type size\n"); */
-    /*   // We need to clean up here in the future */
-    /*   return ncclInternalError; */
-    /* } */
-
-    /* size_t count = eDescr->coll.count; */
-    /* event->name = get_nccl_coll_name(name); */
-    /* size_t bufferSize = count * type_size; */
-    /* uint64_t correlationId; */
-    /* int bucket_index = choose_bucket(bufferSize); */
 
     // Update the time in case proxy ops are used
     // event->base.startTs = event->base.stopTs;

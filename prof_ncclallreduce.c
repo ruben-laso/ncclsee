@@ -66,14 +66,14 @@ int main(int argc, char *argv[]) {
     cudaFree(sendbuff);
     cudaFree(recvbuff);
 
-    // Perform NCCL AllReduce (summing across ranks).
+    // Perform NCCL AllGather and Allreduce.
     count = 128;
     cudaMalloc((void **)&sendbuff, count * sizeof(float));
     cudaMalloc((void **)&recvbuff, count * sizeof(float));
     cudaMemcpy(sendbuff, hostBuffer, count * sizeof(float), cudaMemcpyHostToDevice);
-    for(int i = 0; i < 3; i++) {
+    for(int i = 0; i < 4; i++) {
         ncclAllGather(sendbuff, recvbuff, count, ncclFloat, comm, cudaStreamDefault);
-        /* ncclAllReduce(sendbuff, recvbuff, count, ncclFloat, ncclSum, comm, cudaStreamDefault); */
+        ncclAllReduce(sendbuff, recvbuff, count, ncclFloat, ncclSum, comm, cudaStreamDefault);
     }
     // Synchronize device to ensure the AllReduce (and its kernels) complete.
     cudaDeviceSynchronize();

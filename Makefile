@@ -6,7 +6,7 @@ CFLAGS = -Wall -Wextra -std=c11 -O3 #-DDEBUG
 
 default: $(PLUGIN_SO)
 
-$(PLUGIN_SO): example.c
+$(PLUGIN_SO): ncclsee.c
 	$(CC) $(INC) $(LIBS) $(CFLAGS) -g -fPIC -shared -o $@ -Wl,-soname,$(PLUGIN_SO) $^ -lnccl -lcudart -lcupti -latomic -pthread
 
 test: prof_ncclallreduce.c
