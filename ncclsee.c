@@ -21,7 +21,6 @@
 #define COLL_POOL_SIZE 64
 #define P2P_POOL_SIZE 64
 #define PROXY_POOL_SIZE 64
-#define CUPTI_BUFFER_SIZE 4 * 1024
 
 #define MAX_CHANNELS 32
 #define MAX_STEPS 16

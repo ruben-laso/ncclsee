@@ -10,10 +10,10 @@
 // --------------------------------------------------------------------------
 
 // Size of each buffer chunk within the pool
-#define POOL_BUFFER_SIZE (4096)
+#define POOL_BUFFER_SIZE (16384)
 
 // Number of buffer chunks in the pool.
-#define POOL_BUFFER_COUNT 16
+#define POOL_BUFFER_COUNT 64
 
 // Total size of the contiguous memory block required for the entire pool
 #define TOTAL_POOL_SIZE (POOL_BUFFER_SIZE * POOL_BUFFER_COUNT)

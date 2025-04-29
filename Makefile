@@ -43,7 +43,7 @@ MPICC ?= mpicc
 # consistently if you want debugging symbols. If -g is only for specific
 # targets, keep it in the rule. Let's follow the original's intent
 # and add -g back into the rules, keeping CFLAGS for general options.
-CFLAGS = -Wall -Wextra -std=c11 -O1 #-DDEBUG
+CFLAGS = -Wall -Wextra -std=c11 -O3 #-DDEBUG
 
 # ------------------------------------------------------------------------------
 # Paths derived from Configuration Variables
@@ -87,7 +87,7 @@ TEST_EXEC := prof_ncclallreduce # Name for the test executable
 default: $(PLUGIN_SO)
 
 $(PLUGIN_SO): ncclsee.c buffer_pool.c
-	$(CC) $(CFLAGS) $(INC) $(LIBS) -g -fPIC -shared -o $@ -Wl,-soname,$@ $^ $(PLUGIN_LIBS)
+	$(CC) $(CFLAGS) $(INC) $(LIBS) -fPIC -shared -o $@ -Wl,-soname,$@ $^ $(PLUGIN_LIBS)
 
 # ------------------------------------------------------------------------------
 # Test Target: Build the test executable
