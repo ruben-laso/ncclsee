@@ -14,7 +14,7 @@
 #include <cuda_runtime_api.h>
 #include <cupti.h>
 #include "profiler.h"
-#include "utarray.h"
+#include "buffer_pool.h"
 
 #define __hidden __attribute__((visibility("hidden")))
 #define GROUP_POOL_SIZE 64
@@ -79,6 +79,7 @@ static struct
 {
   uint64_t count;
   uint64_t bytes;
+  //_Atomic double time;
   _Atomic double time;
   // We may add more things here
 } stats[nccl_num_colls][NUM_BUCKETS] = {0};
@@ -87,12 +88,14 @@ static struct
 {
   uint64_t count;
   uint64_t typecount;
+  //_Atomic double time;
   _Atomic double time;
 } stats_p2p[nccl_num_p2p][NUM_BUCKETS] = {0};
 
 static struct
 {
   uint64_t count;
+  //_Atomic double time;
   _Atomic double time;
 } stats_group = {0};
 
@@ -157,7 +160,7 @@ struct context
   struct proxyOp proxyPool[PROXY_POOL_SIZE];
 };
 
-uint8_t cupti_buffer[CUPTI_BUFFER_SIZE]; // 32KB buffer for CUPTI activity records.
+static uint8_t cupti_buffer[TOTAL_POOL_SIZE]; // 32KB buffer for CUPTI activity records.
 
 static int initialized; // initialization counter for profiler
 static FILE *debug_file = NULL;
@@ -251,20 +254,17 @@ __hidden void calibrate() {
 }
 
 // returns current timestamp in useconds
-__hidden double gettime_us(void)
+__hidden double gettime_ns(void)
 {
   // return __rdtsc() / freq;
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
-  return ((ts.tv_sec * 1e6) + (ts.tv_nsec / 1e3));
+  return ((ts.tv_sec * 1e9) + ts.tv_nsec);
 }
 
-uint64_t gettime()
+double gettime()
 {
-  return __rdtsc() / freq;
-  // struct timespec ts;
-  // clock_gettime(CLOCK_MONOTONIC, &ts);
-  // return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+  return (double)__rdtsc() / freq;
 }
 
 static int getNCCLTypeSize(const char *datatype)
@@ -389,10 +389,11 @@ void atomic_add_double(_Atomic double *target, double increment)
 // CUPTI callback: Allocate a buffer for activity records.
 void CUPTIAPI bufferRequested(uint8_t **buffer, size_t *size, size_t *maxNumRecords)
 {
-  *size = CUPTI_BUFFER_SIZE;
-  *buffer = (uint8_t *)malloc(*size);
+  *size = POOL_BUFFER_SIZE;
+  size_t actual_size = 0;
+  *buffer = get_buffer_from_pool(&actual_size);
   //*buffer = cupti_buffer;
-  if (*buffer == NULL)
+  if (*buffer == NULL ||  actual_size != POOL_BUFFER_SIZE)
   {
     fprintf(stderr, "Error: unable to allocate CUPTI buffer\n");
     exit(-1);
@@ -407,16 +408,6 @@ void CUPTIAPI bufferCompleted(CUcontext context, uint32_t streamId,
   CUpti_Activity *record = NULL;
   uint64_t previous_external_id = 0;
   uint32_t previous_correlation_id = 0;
-  /* int offset = -1; // We will use this to calculate the index ot the correlation_ids array */
-
-  /* UT_icd uint64t_icd = {sizeof(uint64_t), NULL, NULL, NULL}; */
-  /* UT_icd double_icd = {sizeof(double), NULL, NULL, NULL}; */
-
-  /* UT_array *correlation_ids, *kernel_data; */
-  /* utarray_new(correlation_ids, &uint64t_icd); */
-  /* utarray_new(kernel_data, &double_icd); */
-  /* utarray_reserve(correlation_ids, 128); */
-  /* utarray_reserve(kernel_data, 128); */
 
   do
   {
@@ -428,15 +419,8 @@ void CUPTIAPI bufferCompleted(CUcontext context, uint32_t streamId,
     {
       CUpti_ActivityExternalCorrelation *correlation =
           (CUpti_ActivityExternalCorrelation *)record;
-      /* printf("EXTERNAL CORRELATION: correlationId=%u, externalId=%lu\n", */
-      /*        correlation->correlationId, */
-      /*        correlation->externalId); */
       previous_external_id = correlation->externalId;
       previous_correlation_id = correlation->correlationId;
-      /* if (offset = -1){ */
-      /*   offset = correlation->correlationId; */
-      /* } */
-      /* utarray_push_back(correlation_ids, &(correlation->externalId)); */
     }
     else if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL)
     {
@@ -450,6 +434,7 @@ void CUPTIAPI bufferCompleted(CUcontext context, uint32_t streamId,
         // Check if we have a valid correlation
         getCorrelation(previous_external_id, &opType, &bucketIndex);
         stats[opType][bucketIndex].time += (kernel->end - kernel->start);
+        //atomic_add_double(&stats[opType][bucketIndex].time, kernel->end - kernel->start);
         /* printf("KERNEL: name=%s, Operation=%s, Bucket Index=%d\n", */
         /*        kernel->name,nccl_coll_names[opType],bucketIndex); */
       }
@@ -467,8 +452,8 @@ void CUPTIAPI bufferCompleted(CUcontext context, uint32_t streamId,
              api->cbid, api->correlationId);
     }
   } while (1);
-
-  free(buffer);
+  return_buffer_to_pool(buffer);
+  //free(buffer);
 }
 
 // Dont forget to register the function in Profiler_Init
@@ -524,7 +509,7 @@ __hidden ncclResult_t Profiler_Init(void **context, int *eActivationMask)
       CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
       correlationId));
 
-  cudaDeviceSynchronize();
+  //cudaDeviceSynchronize();
 
   pthread_mutex_lock(&lock);
   if (__atomic_fetch_add(&initialized, 1, __ATOMIC_RELAXED) == 0)
@@ -535,6 +520,14 @@ __hidden ncclResult_t Profiler_Init(void **context, int *eActivationMask)
     __atomic_store_n(eActivationMask, str ? atoi(str) : defaultEActivationMask, __ATOMIC_RELAXED);
     pid = getpid();
     calibrate();
+    if ( freq == -1 )
+    {
+      fprintf(stderr, "Profiler_Init: Error calibrating CPU frequency\n");
+      fflush(stderr);
+      pthread_mutex_unlock(&lock);
+      return ncclInternalError;
+    }
+    init_buffer_pool(cupti_buffer);
     startTime = gettime();
   }
   pthread_mutex_unlock(&lock);
@@ -574,7 +567,7 @@ __hidden ncclResult_t Profiler_Finalize(void *context)
 
 fprintf(stderr, "\n=========================== NCCL PROFILING SUMMARY ===========================================\n");
 fprintf(stderr, "%-18s %-18s %-18s %-20s %-15s\n",
-        "Collective Type", "Bucket (B)", "Calls", "Bytes Transferred", "Total Time (ms)");
+        "Collective Type", "Bucket (B)", "Calls", "Bytes Transferred", "Total Time (us)");
 fprintf(stderr, "------------------------------------------------------------------------------------------------\n");
 
 for (int i = 0; i < nccl_num_colls; i++) {
@@ -600,7 +593,7 @@ for (int i = 0; i < nccl_num_colls; i++) {
 
     fprintf(stderr, "%-18s %-18s %-18" PRIu64 " %-20" PRIu64 " %-15.6f\n",
             nccl_coll_names[i], bucket_range, stats[i][j].count,
-            stats[i][j].bytes, stats[i][j].time / 1e6);
+            stats[i][j].bytes, stats[i][j].time / 1e3);
 
     total_count += stats[i][j].count;
     total_bytes += stats[i][j].bytes;
@@ -610,13 +603,13 @@ for (int i = 0; i < nccl_num_colls; i++) {
   // Print totals for this collective type if any calls were made
   if (total_count > 0) {
     fprintf(stderr, "%-18s %-18s %-18" PRIu64 " %-20" PRIu64 " %-15.6f\n",
-            nccl_coll_names[i], "TOTAL", total_count, total_bytes, total_time / 1e6);
+            nccl_coll_names[i], "TOTAL", total_count, total_bytes, total_time / 1e3);
     fprintf(stderr, "------------------------------------------------------------------------------------------------\n");
   }
 }
 
 fprintf(stderr, "%-18s %-18s %-18" PRIu64 " %-20" PRIu64 " %-15.6f\n",
-        "Group", "N/A", stats_group.count, (uint64_t)0, stats_group.time / 1e6);
+        "Group", "N/A", stats_group.count, (uint64_t)0, stats_group.time / 1e3);
 fprintf(stderr, "==================================================================================================\n\n");
 
 
@@ -625,6 +618,7 @@ fprintf(stderr, "===============================================================
     free(ctx);
   if (debug_file)
     fclose(debug_file);
+  destroy_buffer_pool();
   return ncclSuccess;
 }
 
@@ -646,10 +640,12 @@ ncclResult_t Profiler_Event_Start(void *context, void **eHandle, ncclProfilerEve
     // Get the next index in the group pool (circular buffer behavior)
     int index = __atomic_fetch_add(&ctx->groupIndex, 1, __ATOMIC_RELAXED) % GROUP_POOL_SIZE;
     struct group *event = &ctx->groupPool[index];
+    event->startTs = gettime() - startTime;
     event->ctx = ctx;
     event->type = ncclProfileGroup;
-    __atomic_fetch_add(&stats_group.count, 1, __ATOMIC_RELAXED);
-    event->startTs = gettime();
+    //__atomic_fetch_add(&stats_group.count, 1, __ATOMIC_RELAXED);
+    stats_group.count++;
+    //event->startTs = gettime();
     *eHandle = event;
   }
   else if (eDescr->type == ncclProfileColl)
@@ -662,6 +658,7 @@ ncclResult_t Profiler_Event_Start(void *context, void **eHandle, ncclProfilerEve
     int index = __atomic_fetch_add(&ctx->collIndex, 1, __ATOMIC_RELAXED) % COLL_POOL_SIZE;
     struct collective *event = &ctx->collPool[index];
 
+    event->base.startTs = gettime() - startTime;
     event->base.type = ncclProfileColl;
     size_t trafficBytes = eDescr->coll.trafficBytes;
     event->base.parent = parent;
@@ -711,13 +708,13 @@ ncclResult_t Profiler_Event_Start(void *context, void **eHandle, ncclProfilerEve
     fflush(debug_file);
 #endif
     // It is better to update those now so we dont carry them around
-    /* __atomic_fetch_add(&stats[event->name].count, 1, __ATOMIC_RELAXED); */
-    /* __atomic_fetch_add(&stats[event->name].bytes, trafficBytes, __ATOMIC_RELAXED); */
 
-    __atomic_fetch_add(&stats[event->name][bucket_index].count, 1, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&stats[event->name][bucket_index].bytes, trafficBytes, __ATOMIC_RELAXED);
+    /* __atomic_fetch_add(&stats[event->name][bucket_index].count, 1, __ATOMIC_RELAXED); */
+    /* __atomic_fetch_add(&stats[event->name][bucket_index].bytes, trafficBytes, __ATOMIC_RELAXED); */
+    stats[event->name][bucket_index].count++;
+    stats[event->name][bucket_index].bytes += trafficBytes;
     event->bucket_index = bucket_index;
-    event->base.startTs = gettime();
+    //event->base.startTs = gettime();
     *eHandle = event;
   }
   else if (eDescr->type == ncclProfileP2p)
@@ -725,8 +722,10 @@ ncclResult_t Profiler_Event_Start(void *context, void **eHandle, ncclProfilerEve
     struct group *parent = (struct group *)eDescr->parentObj;
     if (parent == NULL)
       return ncclSuccess;
+
     int index = __atomic_fetch_add(&ctx->p2pIndex, 1, __ATOMIC_RELAXED) % P2P_POOL_SIZE;
     struct p2p *event = &ctx->p2pPool[index];
+    event->base.startTs = gettime() - startTime;
     event->base.type = ncclProfileP2p;
     event->base.parent = parent;
     const char *name = eDescr->coll.func;
@@ -761,12 +760,12 @@ ncclResult_t Profiler_Event_Start(void *context, void **eHandle, ncclProfilerEve
                                                         correlationId));
       generateCorrelationId();
     
-    /* __atomic_fetch_add(&stats_p2p[event->name].count, 1, __ATOMIC_RELAXED); */
-    /* __atomic_fetch_add(&stats_p2p[event->name].typecount, eDescr->p2p.count, __ATOMIC_RELAXED); */
 
-    __atomic_fetch_add(&stats_p2p[event->name][bucket_index].count, 1, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&stats_p2p[event->name][bucket_index].typecount, eDescr->p2p.count, __ATOMIC_RELAXED);
-    event->base.startTs = gettime();
+    /* __atomic_fetch_add(&stats_p2p[event->name][bucket_index].count, 1, __ATOMIC_RELAXED); */
+    /* __atomic_fetch_add(&stats_p2p[event->name][bucket_index].typecount, eDescr->p2p.count, __ATOMIC_RELAXED); */
+    stats_p2p[event->name][bucket_index].count++;
+    stats_p2p[event->name][bucket_index].typecount += eDescr->p2p.count;
+    //event->base.startTs = gettime();
     *eHandle = event;
   }
   else if (eDescr->type == ncclProfileProxyOp)
@@ -827,7 +826,8 @@ static void updateEvent(void *handle)
     struct group *event = (struct group *)handle;
     if (__atomic_sub_fetch(&event->refCount, 1, __ATOMIC_RELAXED) == 0)
     {
-      event->stopTs = gettime();
+      event->stopTs = gettime() - startTime;
+      //event->stopTs = gettime();
       double duration = event->stopTs - event->startTs;
       stats_group.time += duration;
     }
@@ -837,7 +837,8 @@ static void updateEvent(void *handle)
     struct collective *event = (struct collective *)handle;
     if (__atomic_sub_fetch(&event->base.refCount, 1, __ATOMIC_RELAXED) == 0)
     {
-      event->base.stopTs = gettime();
+      event->base.stopTs = gettime() - startTime;
+      //event->base.stopTs = gettime();
       double duration = event->base.stopTs - event->base.startTs;
       // Update the time in stats
       // fprintf(debug_file, "Collective %s took %lf us\n", nccl_coll_names[event->name], duration);
@@ -852,7 +853,8 @@ static void updateEvent(void *handle)
     struct p2p *event = (struct p2p *)handle;
     if (__atomic_sub_fetch(&event->base.refCount, 1, __ATOMIC_RELAXED) == 0)
     {
-      event->base.stopTs = gettime();
+      event->base.stopTs = gettime() - startTime;
+      //event->base.stopTs = gettime();
       double duration = event->base.stopTs - event->base.startTs;
       // Update the time in stats
       // fprintf(debug_file, "P2P %s took %lf us\n", nccl_p2p_names[event->name], duration);
@@ -883,23 +885,25 @@ __hidden ncclResult_t Profiler_Event_Stop(void *eHandle)
   if (type == ncclProfileGroup)
   {
     struct group *event = (struct group *)eHandle;
-    event->stopTs = gettime();
+    event->stopTs = gettime() - startTime;
+    //event->stopTs = gettime();
     // Update the time in stats atomically
-    atomic_add_double(&stats_group.time, event->stopTs - event->startTs);
+    /* atomic_add_double(&stats_group.time, event->stopTs - event->startTs); */
+    stats_group.time += event->stopTs - event->startTs;
 #ifdef DEBUG
     fprintf(debug_file, "Group took %lf us, Accumulated %lf\n", event->stopTs - event->startTs, stats_group.time);
     fflush(debug_file);
 #endif
-    // Update the time in case proxy ops are used
-    // event->startTs = event->stopTs;
     return ncclSuccess;
   }
   else if (type == ncclProfileColl)
   {
     struct collective *event = (struct collective *)eHandle;
-    event->base.stopTs = gettime();
+    event->base.stopTs = gettime() - startTime;
+    //event->base.stopTs = gettime();
     // Update the time in collective stats atomically
-    atomic_add_double(&stats[event->name][event->bucket_index].time, event->base.stopTs - event->base.startTs);
+    //atomic_add_double(&stats[event->name][event->bucket_index].time, event->base.stopTs - event->base.startTs);
+    stats[event->name][event->bucket_index].time += event->base.stopTs - event->base.startTs;
 
     // Update the time in case proxy ops are used
     // event->base.startTs = event->base.stopTs;
@@ -910,7 +914,8 @@ __hidden ncclResult_t Profiler_Event_Stop(void *eHandle)
   else if (type == ncclProfileP2p)
   {
     struct p2p *event = (struct p2p *)eHandle;
-    event->base.stopTs = gettime();
+    event->base.stopTs = gettime() - startTime;
+    //event->base.stopTs = gettime();
     stats_p2p[event->name][event->bucket_index].time += event->base.stopTs - event->base.startTs;
     // Update the time in case proxy ops are used
     // event->base.startTs = event->base.stopTs;
