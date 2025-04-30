@@ -33,7 +33,7 @@ PROFILER_EXAMPLE_INC ?= /home/staff/vardas/nccl/ext-profiler/example/nccl
 # ------------------------------------------------------------------------------
 
 # Default C compiler. Can be overridden by the CC environment variable.
-CC ?= gcc
+CC = mpicc
 
 # Default MPI compiler. Can be overridden by the MPICC environment variable.
 MPICC ?= mpicc
@@ -86,7 +86,7 @@ TEST_EXEC := prof_ncclallreduce # Name for the test executable
 
 default: $(PLUGIN_SO)
 
-$(PLUGIN_SO): ncclsee.c buffer_pool.c
+$(PLUGIN_SO): ncclsee.c buffer_pool.c output_file.c
 	$(CC) $(CFLAGS) $(INC) $(LIBS) -fPIC -shared -o $@ -Wl,-soname,$@ $^ $(PLUGIN_LIBS)
 
 # ------------------------------------------------------------------------------
@@ -104,4 +104,7 @@ $(TEST_EXEC): prof_ncclallreduce.c
 # ------------------------------------------------------------------------------
 
 clean:
-	rm -f $(PLUGIN_SO) $(TEST_EXEC)
+	rm -f $(PLUGIN_SO)
+
+clean-test:
+	rm -f $(TEST_EXEC)

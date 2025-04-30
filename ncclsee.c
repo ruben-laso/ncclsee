@@ -15,6 +15,7 @@
 #include <cupti.h>
 #include "profiler.h"
 #include "buffer_pool.h"
+#include "output_file.h"
 
 #define __hidden __attribute__((visibility("hidden")))
 #define GROUP_POOL_SIZE 64
@@ -161,7 +162,8 @@ struct context
 
 static uint8_t cupti_buffer[TOTAL_POOL_SIZE]; // 32KB buffer for CUPTI activity records.
 
-static int initialized; // initialization counter for profiler
+static int initialized = 0; // initialization counter for profiler
+static int output = 0;
 static FILE *debug_file = NULL;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pid_t pid;
@@ -220,7 +222,7 @@ uint64_t generateCorrelationId()
 // Subscribe to CUDA runtime API callbacks
 CUpti_SubscriberHandle subscriber;
 
-__hidden void calibrate_us()
+__hidden void calibrate()
 {
   struct timeval tv;
   gettimeofday(&tv, NULL);
@@ -239,7 +241,7 @@ __hidden void calibrate_us()
 }
 
 
-__hidden void calibrate() {
+__hidden void calibrate_ns() {
   struct timeval tv;
   gettimeofday(&tv, NULL);
   uint64_t timeCycles = __rdtsc();
@@ -430,10 +432,9 @@ void CUPTIAPI bufferCompleted(CUcontext context, uint32_t streamId,
           continue;
         enum nccl_colls opType;
         int bucketIndex;
-        // Check if we have a valid correlation
         getCorrelation(previous_external_id, &opType, &bucketIndex);
-        stats[opType][bucketIndex].time += (kernel->end - kernel->start);
-        //atomic_add_double(&stats[opType][bucketIndex].time, kernel->end - kernel->start);
+        double kernelTime = (kernel->completed - kernel->start) / 1e3; //Convert to microseconds
+        atomic_add_double(&stats[opType][bucketIndex].time, kernelTime);
         /* printf("KERNEL: name=%s, Operation=%s, Bucket Index=%d\n", */
         /*        kernel->name,nccl_coll_names[opType],bucketIndex); */
       }
@@ -564,15 +565,29 @@ __hidden ncclResult_t Profiler_Finalize(void *context)
   CUPTI_CALL(cuptiFinalize());
 
 
-fprintf(stderr, "\n=========================== NCCL PROFILING SUMMARY ===========================================\n");
-fprintf(stderr, "%-18s %-18s %-18s %-20s %-15s\n",
-        "Collective Type", "Bucket (B)", "Calls", "Bytes Transferred", "Total Time (us)");
-fprintf(stderr, "------------------------------------------------------------------------------------------------\n");
+
+pthread_mutex_lock(&lock);
+  if (__atomic_fetch_add(&output, 1, __ATOMIC_RELAXED) == 0){
+    FILE *fp = create_profile_file();
+    if (fp == NULL)
+    {
+      fprintf(stderr, "ncclsee Error: creating profile file\n");
+      pthread_mutex_unlock(&lock);
+      return ncclInternalError;
+    }
+/* fprintf(stderr, "\n=========================== NCCL PROFILING SUMMARY ===========================================\n"); */
+/* fprintf(stderr, "%-18s %-18s %-18s %-20s %-15s\n", */
+/*         "Collective Type", "Bucket (B)", "Calls", "Bytes Transferred", "Total Time (us)"); */
+/* fprintf(stderr, "------------------------------------------------------------------------------------------------\n"); */
+
+  // Example: Write the header
+  fprintf(fp, "CollectiveType,BucketLabel,BucketMin,BucketMax"
+                      "Calls,BytesTransferred,TotalTime_us\n");
 
 for (int i = 0; i < nccl_num_colls; i++) {
-  uint64_t total_count = 0;
-  uint64_t total_bytes = 0;
-  double total_time = 0.0;
+  /* uint64_t total_count = 0; */
+  /* uint64_t total_bytes = 0; */
+  /* double total_time = 0.0; */
 
   for (int j = 0; j < NUM_BUCKETS; j++) {
 
@@ -582,34 +597,55 @@ for (int i = 0; i < nccl_num_colls; i++) {
 
     // Determine bucket range string
     char bucket_range[20];
+    int64_t upper_bound;
     if (j == 0) {
       snprintf(bucket_range, sizeof(bucket_range), "0-%ld", buckets[0]);
+      upper_bound = buckets[0];
+
     } else if (j == NUM_BUCKETS - 1) {
       snprintf(bucket_range, sizeof(bucket_range), ">%ld", buckets[NUM_BUCKETS - 2]);
+      upper_bound = INT32_MAX;
+
     } else {
       snprintf(bucket_range, sizeof(bucket_range), "%ld-%ld", buckets[j-1], buckets[j]);
+      upper_bound = buckets[j];
     }
+    fprintf(fp, "%s,%s,%ld,%ld,%" PRIu64 ",%" PRIu64 ",%.6f\n",
+            nccl_coll_names[i], bucket_range, (long)buckets[j-1], (long)upper_bound,
+            (uint64_t)stats[i][j].count, (uint64_t)stats[i][j].bytes,
+            stats[i][j].time);
 
-    fprintf(stderr, "%-18s %-18s %-18" PRIu64 " %-20" PRIu64 " %-15.6f\n",
-            nccl_coll_names[i], bucket_range, stats[i][j].count,
-            stats[i][j].bytes, stats[i][j].time / 1e3);
+    /* fprintf(stderr, "%-18s %-18s %-18" PRIu64 " %-20" PRIu64 " %-15.6f\n", */
+    /*         nccl_coll_names[i], bucket_range, stats[i][j].count, */
+    /*         stats[i][j].bytes, stats[i][j].time / 1e3); */
 
-    total_count += stats[i][j].count;
-    total_bytes += stats[i][j].bytes;
-    total_time += stats[i][j].time;
+
+    /* total_count += stats[i][j].count; */
+    /* total_bytes += stats[i][j].bytes; */
+    /* total_time += stats[i][j].time; */
   }
 
   // Print totals for this collective type if any calls were made
-  if (total_count > 0) {
-    fprintf(stderr, "%-18s %-18s %-18" PRIu64 " %-20" PRIu64 " %-15.6f\n",
-            nccl_coll_names[i], "TOTAL", total_count, total_bytes, total_time / 1e3);
-    fprintf(stderr, "------------------------------------------------------------------------------------------------\n");
-  }
+  /* if (total_count > 0) { */
+  /*   fprintf(stderr, "%-18s %-18s %-18" PRIu64 " %-20" PRIu64 " %-15.6f\n", */
+  /*           nccl_coll_names[i], "TOTAL", total_count, total_bytes, total_time / 1e3); */
+  /*   fprintf(stderr, "------------------------------------------------------------------------------------------------\n"); */
+  /* } */
 }
 
-fprintf(stderr, "%-18s %-18s %-18" PRIu64 " %-20" PRIu64 " %-15.6f\n",
-        "Group", "N/A", stats_group.count, (uint64_t)0, stats_group.time / 1e3);
-fprintf(stderr, "==================================================================================================\n\n");
+/* fprintf(stderr, "%-18s %-18s %-18" PRIu64 " %-20" PRIu64 " %-15.6f\n", */
+/*         "Group", "N/A", stats_group.count, (uint64_t)0, stats_group.time / 1e3); */
+/* fprintf(stderr, "==================================================================================================\n\n"); */
+fprintf(fp, "Group,N/A,0,0,false,%" PRIu64 ",%" PRIu64 ",%.6f\n",
+        (uint64_t)stats_group.count, (uint64_t)0, stats_group.time);
+if (fclose(fp) != 0) {
+    perror("ncclsee Warning: Failed to close profile file properly");
+} else {
+    fprintf(stderr, "ncclsee: Successfully wrote and closed profile file for PID %d.\n",
+            getpid());
+  }
+  }
+  pthread_mutex_unlock(&lock);
 
 
   struct context *ctx = (struct context *)context;
@@ -828,7 +864,8 @@ static void updateEvent(void *handle)
       event->stopTs = gettime() - startTime;
       //event->stopTs = gettime();
       double duration = event->stopTs - event->startTs;
-      stats_group.time += duration;
+      atomic_add_double(&stats_group.time, duration);
+      /* stats_group.time += duration; */
     }
   }
   else if (type == ncclProfileColl)
@@ -841,7 +878,8 @@ static void updateEvent(void *handle)
       double duration = event->base.stopTs - event->base.startTs;
       // Update the time in stats
       // fprintf(debug_file, "Collective %s took %lf us\n", nccl_coll_names[event->name], duration);
-      stats[event->name][event->bucket_index].time += duration;
+      atomic_add_double(&stats[event->name][event->bucket_index].time, duration);
+      /* stats[event->name][event->bucket_index].time += duration; */
       updateEvent(event->base.parent);
 
       return;
@@ -857,7 +895,8 @@ static void updateEvent(void *handle)
       double duration = event->base.stopTs - event->base.startTs;
       // Update the time in stats
       // fprintf(debug_file, "P2P %s took %lf us\n", nccl_p2p_names[event->name], duration);
-      stats_p2p[event->name][event->bucket_index].time += duration;
+      atomic_add_double(&stats_p2p[event->name][event->bucket_index].time, duration);
+      /* stats_p2p[event->name][event->bucket_index].time += duration; */
       updateEvent(event->base.parent);
       return;
     }
@@ -887,8 +926,8 @@ __hidden ncclResult_t Profiler_Event_Stop(void *eHandle)
     event->stopTs = gettime() - startTime;
     //event->stopTs = gettime();
     // Update the time in stats atomically
-    /* atomic_add_double(&stats_group.time, event->stopTs - event->startTs); */
-    stats_group.time += event->stopTs - event->startTs;
+    atomic_add_double(&stats_group.time, event->stopTs - event->startTs);
+    //stats_group.time += event->stopTs - event->startTs;
 #ifdef DEBUG
     fprintf(debug_file, "Group took %lf us, Accumulated %lf\n", event->stopTs - event->startTs, stats_group.time);
     fflush(debug_file);
@@ -901,8 +940,8 @@ __hidden ncclResult_t Profiler_Event_Stop(void *eHandle)
     event->base.stopTs = gettime() - startTime;
     //event->base.stopTs = gettime();
     // Update the time in collective stats atomically
-    //atomic_add_double(&stats[event->name][event->bucket_index].time, event->base.stopTs - event->base.startTs);
-    stats[event->name][event->bucket_index].time += event->base.stopTs - event->base.startTs;
+    atomic_add_double(&stats[event->name][event->bucket_index].time, event->base.stopTs - event->base.startTs);
+    //stats[event->name][event->bucket_index].time += event->base.stopTs - event->base.startTs;
 
     // Update the time in case proxy ops are used
     // event->base.startTs = event->base.stopTs;
@@ -915,7 +954,8 @@ __hidden ncclResult_t Profiler_Event_Stop(void *eHandle)
     struct p2p *event = (struct p2p *)eHandle;
     event->base.stopTs = gettime() - startTime;
     //event->base.stopTs = gettime();
-    stats_p2p[event->name][event->bucket_index].time += event->base.stopTs - event->base.startTs;
+    atomic_add_double(&stats_p2p[event->name][event->bucket_index].time, event->base.stopTs - event->base.startTs);
+    /* stats_p2p[event->name][event->bucket_index].time += event->base.stopTs - event->base.startTs; */
     // Update the time in case proxy ops are used
     // event->base.startTs = event->base.stopTs;
     return ncclSuccess;
