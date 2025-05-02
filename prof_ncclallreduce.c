@@ -4,6 +4,16 @@
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <nccl.h>
+#include <time.h>
+
+double gettime(void)
+{
+  // return __rdtsc() / freq;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ((ts.tv_sec * 1e6) + (ts.tv_nsec / 1e3));
+}
+
 
 int main(int argc, char *argv[]) {
     // Initialize MPI.
@@ -57,11 +67,15 @@ int main(int argc, char *argv[]) {
     cudaMemset(recvbuff, 0, count * sizeof(float));
 
     // Perform NCCL AllReduce (summing across ranks).
+    double duration = gettime();
     for(int i = 0; i < 1; i++) {
         ncclAllReduce(sendbuff, recvbuff, count, ncclFloat, ncclSum, comm, cudaStreamDefault);
     }
     // Synchronize device to ensure the AllReduce (and its kernels) complete.
     cudaDeviceSynchronize();
+    duration = gettime() - duration;
+    printf("MPI Rank %d: NCCL AllReduce took %f useconds\n", rank, duration);
+
 
     cudaFree(sendbuff);
     cudaFree(recvbuff);
@@ -71,7 +85,7 @@ int main(int argc, char *argv[]) {
     cudaMalloc((void **)&sendbuff, count * sizeof(float));
     cudaMalloc((void **)&recvbuff, count * sizeof(float));
     cudaMemcpy(sendbuff, hostBuffer, count * sizeof(float), cudaMemcpyHostToDevice);
-    for(int i = 0; i < 3; i++) {
+    for(int i = 0; i < 0; i++) {
         ncclAllGather(sendbuff, recvbuff, count, ncclFloat, comm, cudaStreamDefault);
         ncclAllReduce(sendbuff, recvbuff, count, ncclFloat, ncclSum, comm, cudaStreamDefault);
     }

@@ -71,7 +71,7 @@ PLUGIN_LIBS = $(COMMON_LIBS) -latomic -pthread
 # ------------------------------------------------------------------------------
 
 PLUGIN_SO := libnccl-profiler.so
-TEST_EXEC := prof_ncclallreduce # Name for the test executable
+TEST_EXEC := prof_ncclallreduce.out # Name for the test executable
 
 # ------------------------------------------------------------------------------
 # Phony Targets

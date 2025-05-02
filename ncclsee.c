@@ -34,6 +34,8 @@ static const int defaultEActivationMask = ncclProfileColl | ncclProfileP2p | ncc
 
 static const int64_t buckets[NUM_BUCKETS - 1] = {128, 1024, 8192, 65536, 262144, 1048576, 33554432};
 
+char timestamp_str[32]; // Sufficient for "YYYYMMDD_HHMMSS" + null terminator
+
 /* uint64_t timestamps[1024] = {0}; */
 uint32_t event_counter = 0;
 
@@ -494,6 +496,31 @@ void CUPTIAPI cupti_callback_handler(void *userdata, CUpti_CallbackDomain domain
 __hidden ncclResult_t Profiler_Init(void **context, int *eActivationMask)
 {
 
+
+  struct tm *local_time;
+  time_t now;
+
+
+  // 1. Get current time and format it
+  now = time(NULL);
+  if (now == ((time_t)-1)) {
+    perror("Failed to get current time");
+    return ncclInternalError;
+  }
+
+  local_time = localtime(&now);
+  if (local_time == NULL) {
+    perror("Failed to convert time to local time structure");
+    return ncclInternalError;
+  }
+
+  // We use this timestamp to create the output folder
+  if (strftime(timestamp_str, sizeof(timestamp_str), "%Y%m%d_%H%M%S",
+               local_time) == 0) {
+    fprintf(stderr, "ncclsee Error: Failed to format timestamp (strftime returned 0)\n");
+    return ncclInternalError;
+  }
+
   CUPTI_CALL(cuptiSubscribe(&subscriber, (CUpti_CallbackFunc)cupti_callback_handler, NULL));
   CUPTI_CALL(cuptiEnableDomain(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API));
 
@@ -568,7 +595,7 @@ __hidden ncclResult_t Profiler_Finalize(void *context)
 
 pthread_mutex_lock(&lock);
   if (__atomic_fetch_add(&output, 1, __ATOMIC_RELAXED) == 0){
-    FILE *fp = create_profile_file();
+    FILE *fp = create_profile_file(timestamp_str);
     if (fp == NULL)
     {
       fprintf(stderr, "ncclsee Error: creating profile file\n");
@@ -581,7 +608,7 @@ pthread_mutex_lock(&lock);
 /* fprintf(stderr, "------------------------------------------------------------------------------------------------\n"); */
 
   // Example: Write the header
-  fprintf(fp, "CollectiveType,BucketLabel,BucketMin,BucketMax"
+  fprintf(fp, "CollectiveType,BucketLabel,BucketMin,BucketMax,"
                       "Calls,BytesTransferred,TotalTime_us\n");
 
 for (int i = 0; i < nccl_num_colls; i++) {
@@ -597,21 +624,24 @@ for (int i = 0; i < nccl_num_colls; i++) {
 
     // Determine bucket range string
     char bucket_range[20];
-    int64_t upper_bound;
+    int64_t upper_bound,lower_bound;
     if (j == 0) {
       snprintf(bucket_range, sizeof(bucket_range), "0-%ld", buckets[0]);
       upper_bound = buckets[0];
+      lower_bound = 0;
 
     } else if (j == NUM_BUCKETS - 1) {
       snprintf(bucket_range, sizeof(bucket_range), ">%ld", buckets[NUM_BUCKETS - 2]);
       upper_bound = INT32_MAX;
+      lower_bound = buckets[NUM_BUCKETS - 2];
 
     } else {
       snprintf(bucket_range, sizeof(bucket_range), "%ld-%ld", buckets[j-1], buckets[j]);
       upper_bound = buckets[j];
+      lower_bound = buckets[j-1];
     }
     fprintf(fp, "%s,%s,%ld,%ld,%" PRIu64 ",%" PRIu64 ",%.6f\n",
-            nccl_coll_names[i], bucket_range, (long)buckets[j-1], (long)upper_bound,
+            nccl_coll_names[i], bucket_range, (long)lower_bound, (long)upper_bound,
             (uint64_t)stats[i][j].count, (uint64_t)stats[i][j].bytes,
             stats[i][j].time);
 

@@ -26,38 +26,17 @@
  * or NULL on failure (e.g., cannot create directory, cannot open file).
  * Prints error messages to stderr on failure.
  */
-FILE *create_profile_file() {
-  char timestamp_str[20]; // Sufficient for "YYYYMMDD_HHMMSS" + null terminator
+FILE *create_profile_file(char *timestamp_str) {
   char dir_path[PATH_MAX];
   char file_path[PATH_MAX];
-  time_t now;
-  struct tm *local_time;
   pid_t pid;
 
-  // 1. Get current time and format it
-  now = time(NULL);
-  if (now == ((time_t)-1)) {
-    perror("Failed to get current time");
-    return NULL;
-  }
-
-  local_time = localtime(&now);
-  if (local_time == NULL) {
-    perror("Failed to convert time to local time structure");
-    return NULL;
-  }
-
-  if (strftime(timestamp_str, sizeof(timestamp_str), "%Y%m%d_%H%M%S",
-               local_time) == 0) {
-    fprintf(stderr, "ncclsee Error: Failed to format timestamp (strftime returned 0)\n");
-    return NULL;
-  }
 
   // 2. Construct directory path
   // Using snprintf for safety against buffer overflows
   int chars_written =
       snprintf(dir_path, sizeof(dir_path), "ncclsee_%s", timestamp_str);
-  if (chars_written < 0 || chars_written >= sizeof(dir_path)) {
+  if (chars_written < 0 || (long unsigned int)chars_written >= sizeof(dir_path)) {
     fprintf(stderr, "ncclsee Error: Failed to construct directory path (snprintf "
                     "failed or truncated)\n");
     return NULL;
@@ -93,7 +72,7 @@ FILE *create_profile_file() {
   // 5. Construct full file path
   chars_written =
       snprintf(file_path, sizeof(file_path), "%s/%d.csv", dir_path, pid);
-  if (chars_written < 0 || chars_written >= sizeof(file_path)) {
+  if (chars_written < 0 || (long unsigned int)chars_written >= sizeof(file_path)) {
     fprintf(stderr, "ncclsee Error: Failed to construct file path (snprintf failed or "
                     "truncated)\n");
     return NULL;
