@@ -437,8 +437,7 @@ void CUPTIAPI bufferCompleted(CUcontext context, uint32_t streamId,
         getCorrelation(previous_external_id, &opType, &bucketIndex);
         double kernelTime = (kernel->completed - kernel->start) / 1e3; //Convert to microseconds
         atomic_add_double(&stats[opType][bucketIndex].time, kernelTime);
-        /* printf("KERNEL: name=%s, Operation=%s, Bucket Index=%d\n", */
-        /*        kernel->name,nccl_coll_names[opType],bucketIndex); */
+        printf("KERNEL: name=%s\n", kernel->name);
       }
       else{
         /* printf("KERNEL: name=%s, correlationId=%u, previous_external_id=%lu, previous_correlation_id=%u \n", */
@@ -521,20 +520,6 @@ __hidden ncclResult_t Profiler_Init(void **context, int *eActivationMask)
     return ncclInternalError;
   }
 
-  CUPTI_CALL(cuptiSubscribe(&subscriber, (CUpti_CallbackFunc)cupti_callback_handler, NULL));
-  CUPTI_CALL(cuptiEnableDomain(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API));
-
-  // Initialize CUPTI to record kernel events
-  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION));
-  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_DRIVER));
-  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
-
-  CUPTI_CALL(cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted));
-
-  uint64_t correlationId = generateCorrelationId();
-  CUPTI_CALL(cuptiActivityPushExternalCorrelationId(
-      CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
-      correlationId));
 
   //cudaDeviceSynchronize();
 
@@ -558,6 +543,22 @@ __hidden ncclResult_t Profiler_Init(void **context, int *eActivationMask)
     startTime = gettime();
   }
   pthread_mutex_unlock(&lock);
+
+
+  CUPTI_CALL(cuptiSubscribe(&subscriber, (CUpti_CallbackFunc)cupti_callback_handler, NULL));
+  CUPTI_CALL(cuptiEnableDomain(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API));
+
+  // Initialize CUPTI to record kernel events
+  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION));
+  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_DRIVER));
+  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
+
+  CUPTI_CALL(cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted));
+
+  uint64_t correlationId = generateCorrelationId();
+  CUPTI_CALL(cuptiActivityPushExternalCorrelationId(
+      CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
+      correlationId));
 
   /* fprintf(stderr, "Profiler_Init: %s\n",plugin_name); */
   /* fprintf(stderr, "Profiler_Init: eActivationMask = %d\n", *eActivationMask); */
@@ -666,7 +667,7 @@ for (int i = 0; i < nccl_num_colls; i++) {
 /* fprintf(stderr, "%-18s %-18s %-18" PRIu64 " %-20" PRIu64 " %-15.6f\n", */
 /*         "Group", "N/A", stats_group.count, (uint64_t)0, stats_group.time / 1e3); */
 /* fprintf(stderr, "==================================================================================================\n\n"); */
-fprintf(fp, "Group,N/A,0,0,false,%" PRIu64 ",%" PRIu64 ",%.6f\n",
+fprintf(fp, "Group,N/A,0,0,%" PRIu64 ",%" PRIu64 ",%.6f\n",
         (uint64_t)stats_group.count, (uint64_t)0, stats_group.time);
 if (fclose(fp) != 0) {
     perror("ncclsee Warning: Failed to close profile file properly");
