@@ -437,7 +437,7 @@ void CUPTIAPI bufferCompleted(CUcontext context, uint32_t streamId,
         getCorrelation(previous_external_id, &opType, &bucketIndex);
         double kernelTime = (kernel->completed - kernel->start) / 1e3; //Convert to microseconds
         atomic_add_double(&stats[opType][bucketIndex].time, kernelTime);
-        printf("KERNEL: name=%s\n", kernel->name);
+        // printf("KERNEL: name=%s\n", kernel->name);
       }
       else{
         /* printf("KERNEL: name=%s, correlationId=%u, previous_external_id=%lu, previous_correlation_id=%u \n", */
