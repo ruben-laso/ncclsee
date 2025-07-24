@@ -688,7 +688,7 @@ if (fclose(fp) != 0) {
   return ncclSuccess;
 }
 
-ncclResult_t Profiler_Event_Start(void *context, void **eHandle, ncclProfilerEventDescr_t *eDescr)
+ncclResult_t Profiler_Event_Start(void *context, void **eHandle, ncclProfilerEventDescr_v2_t *eDescr)
 {
   *eHandle = NULL;
   struct context *ctx = (struct context *)context;
@@ -739,7 +739,7 @@ ncclResult_t Profiler_Event_Start(void *context, void **eHandle, ncclProfilerEve
       // We need to clean up here in the future
       return ncclInternalError;
     }
-   
+
     size_t count = eDescr->coll.count;
     event->name = get_nccl_coll_name(name);
     size_t bufferSize = count * type_size;
@@ -749,7 +749,7 @@ ncclResult_t Profiler_Event_Start(void *context, void **eHandle, ncclProfilerEve
     CUptiResult popStatus = cuptiActivityPopExternalCorrelationId(
       CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
       &correlationId);
-  
+
   if (popStatus == CUPTI_ERROR_QUEUE_EMPTY) {
       // Handle empty queue case - either skip correlation or generate new ID
       correlationId = generateCorrelationId();
@@ -825,7 +825,7 @@ ncclResult_t Profiler_Event_Start(void *context, void **eHandle, ncclProfilerEve
       CUPTI_CALL(cuptiActivityPushExternalCorrelationId(CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM2,
                                                         correlationId));
       generateCorrelationId();
-    
+
 
     /* __atomic_fetch_add(&stats_p2p[event->name][bucket_index].count, 1, __ATOMIC_RELAXED); */
     /* __atomic_fetch_add(&stats_p2p[event->name][bucket_index].typecount, eDescr->p2p.count, __ATOMIC_RELAXED); */
